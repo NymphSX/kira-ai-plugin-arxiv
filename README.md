@@ -14,6 +14,14 @@ arXiv 学术助手插件 v2.1.0 —— 由 `kira-ai-plugin-arxiv-search` 与 `pd
   - PDF 直接翻译：`pdf_path` → 提取 → 分块 → 翻译（断点续传）→ 重组 Markdown → xelatex 编译
   - 长 PDF 自动转后台任务（返回任务 ID、进度可查、完成推送）
 
+## v2.1.0 新增
+
+- **断点续翻**：源码优先翻译的任务级 checkpoint 缓存，进程重启/中断后可从中断处继续，不重复烧 token
+- **公式保护**：PDF 直翻路线自动识别公式行并用 `$...$` 包裹，避免公式被当正文乱译；编译时数学段不被转义破坏
+- **`/arxiv task` 命令**：查后台翻译任务进度（不传 ID 列出全部活跃任务）
+- **进度汇报开关**：`debug.progress_report`（默认关），后台块级进度只写日志不打扰 QQ；完成/失败通知始终推送
+- **稳定性**：arXiv API 429/5xx 指数退避重试、后台任务自动清理（防内存泄漏）、请求头/opener 缓存
+
 ## LLM 工具
 
 | 工具 | 说明 |
@@ -45,13 +53,28 @@ arXiv 学术助手插件 v2.1.0 —— 由 `kira-ai-plugin-arxiv-search` 与 `pd
 
 - **arXiv 设置**：默认搜索条数、请求超时、User-Agent、排序、下载目录
 - **翻译设置**：摘要翻译开关与目标语言
-- **PDF 翻译**：翻译模型（model_select 下拉，默认快速模型 `3937f0fdf6b7:deepseek-v4-flash-0731`，留空回退旧字段/默认 LLM）、API Base URL/Key 覆盖（留空读对应 provider 配置）、分块大小、后台任务阈值、输出目录、Mineru 后端开关
+- **PDF 翻译**：PDF 翻译模型（`pdf_translation_model`，model_select 下拉；留空用默认快速模型，兼容旧字段 `translation_model`）、API Base URL/Key 覆盖、分块大小、后台任务阈值、输出目录、Mineru 后端开关
+- **调试**：`progress_report` 后台任务进度汇报开关（默认关，只写日志；开启后推送进度到 QQ）
+
+## 目录结构
+
+```
+data/files/arxiv_pdf/      下载的论文 PDF（产物，不清理）
+data/files/arxiv_src/      下载的 LaTeX 源码包（产物，不清理）
+data/files/pdf_translator/ 翻译输出的中文 PDF / Markdown（产物，不清理）
+data/temp/pdf_translator_work/  解压源码、断点缓存、中间文件（自动清理）
+data/temp/arxiv_download/       下载中的 .part 临时文件（自动清理）
+```
+
+> `data/temp` 由 KiraAI 框架自动清理（默认超 50MB / 50 个文件 / 24 小时，新文件 60 秒保护期），临时文件放这里无需手动处理；产物放 `data/files` 不受影响。
 
 ## 依赖
 
 ```bash
 pip install -r requirements.txt
 ```
+
+**pip 依赖**：`httpx>=0.24`、`pymupdf>=1.24.0`（PDF 提取），`reportlab` 仅测试用。
 
 **系统依赖：必须安装 TeX Live（完整版，含 `xelatex`、`ctex` 宏包与 `bibtex`）**，用于将翻译结果编译为中文 PDF。缺少任一组件会导致 PDF 编译失败：
 
