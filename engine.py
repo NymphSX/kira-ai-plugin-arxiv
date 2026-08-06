@@ -589,13 +589,14 @@ class PdfTranslatorEngine:
         lines = new_lines
 
         # 2. 在 \documentclass 后注入 PassOptionsToPackage + ctex + 条件加载 hyperref
+        #    注意：\makeatletter/\@ifpackageloaded/\makeatother 必须合成单行，
+        #    否则 dedupe（按整文件行集合匹配）会因原论文已有单独的 \makeatletter
+        #    而跳过我们的 \makeatletter，导致 \@ 被当作 \spacefactor 报错。
         have = set(lines)
         inject = [
             "\\PassOptionsToPackage{unicode=true,pdfencoding=auto,psdextra}{hyperref}",
             "\\usepackage[UTF8,fontset=fandol]{ctex}",
-            "\\makeatletter",
-            "\\@ifpackageloaded{hyperref}{}{\\RequirePackage{hyperref}}",
-            "\\makeatother",
+            "\\makeatletter\\@ifpackageloaded{hyperref}{}{\\RequirePackage{hyperref}}\\makeatother",
         ]
         add = [x for x in inject if not any(x in h for h in have)]
         if add:
