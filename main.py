@@ -742,15 +742,6 @@ class ArxivPlugin(BasePlugin):
         try:
             if arxiv_id or tex_path:
                 sid = self._get_sid(event)
-                if not sid:
-                    summary = await asyncio.to_thread(
-                        engine.run_tex,
-                        arxiv_id=arxiv_id or None,
-                        tex_path=tex_path or None,
-                        limit=int(limit or 0),
-                        lang=target_lang,
-                    )
-                    return summary
                 task_id = self._new_task_id()
                 record = {
                     "task_id": task_id,
@@ -1084,7 +1075,7 @@ class ArxivPlugin(BasePlugin):
         """拦截斜杠命令开头的消息（前缀可配置，默认 /arxiv），直接执行，不再进入 LLM 流程。"""
         matched = False
         try:
-            if not self._cfg("enable_commands", True):
+            if not self._cfg("enable_commands", False):
                 return
             text = self._extract_text(event)
             if not text:
