@@ -18,6 +18,7 @@ v0.2: 新增源码优先翻译分支（--arxiv-id/--tex 走 run_tex），xelatex
 """
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -32,7 +33,13 @@ from abc import ABC, abstractmethod
 DEFAULT_MODEL = "deepseek-v4-flash"
 CHUNK_LIMIT = 1200        # 清洗后单个 chunk 上限字符数
 DEFAULT_BLOCK = 1800      # 翻译时合并后每块目标字符数
-RETRIES = 3               # 单块翻译失败重试次数
+RETRIES = 3               # 单块翻译失败重试次数（PDF 路线仍用）
+CONNECT_TIMEOUT = 30      # 连接超时（秒），可配置
+READ_TIMEOUT = 120        # 读超时（秒）：单次 API 调用读上限，可配置
+BLOCK_LIMIT = 2500        # run_tex 翻译块上限字符数（原 4500，防截断）
+GARBAGE_ABORT_RATIO = 0.2 # run_tex 垃圾行占比阈值：超过才中止写回，否则仅告警回退该行
+RETRY_MAX_ATTEMPTS = 2    # _chat_retry 单块最多尝试次数
+RETRY_BUDGET = 360.0      # _chat_retry 单块总时间预算（秒）
 
 SYSTEM = (
     "你是一位专业的中文学术论文翻译，把英文 LaTeX 论文正文翻译成通顺准确的中文学术语言。"
@@ -41,7 +48,12 @@ SYSTEM = (
     "3) 学术缩写（WER、PCC、SSL、CNN、LLM 等）保持原样，不翻译不展开；"
     "4) \\caption{} 内容必须全部翻译；5) 长句拆分为短句，避免长定语堆叠；"
     "6) 被动语态转为主动语态；7) 全文术语一致：翻译前先建立术语表，同一术语全文统一译法；"
-    "8) 保持段落/行结构，不增删内容；只输出译文，不解释。"
+    "8) 保持段落/行结构，不增删内容；只输出译文，不解释；"
+    "9) 输入中形如 __KIRA_PH_0__、__KIRA_CAP_1__ 的标记是受保护 LaTeX 片段占位符，"
+    "代表原样保留的 \\cite/\\label/公式/命令/花括号结构，必须在输出中逐字复制，不得删除、解释或改写；"
+    "10) 若某一行全部由占位符或 LaTeX 命令组成、不含可翻译的英文正文，则该行原样返回，"
+    "不要输出任何评注、问候语、规则复述或\"请提供原文\"；"
+    "11) 输出必须与输入行数完全一致，一行输入对应一行输出；除译文外禁止输出任何其他文字。"
 )
 
 # ----------------------------- 配置定位 -----------------------------
@@ -86,21 +98,60 @@ def load_cfg(root=None, provider_id="deepseek-main", base_url=None, api_key=None
     return base_url.rstrip("/"), api_key
 
 
-def chat(base, key, model, text):
-    """调用 DeepSeek chat/completions，返回译文（temperature=0.2, max_tokens=3000）。"""
+class _SplitTimeoutHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS 连接：connect 阶段用 connect_timeout，读响应阶段切换为 read_timeout。"""
+
+    def __init__(self, *args, connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT, **kw):
+        kw["timeout"] = connect_timeout      # 覆盖 urllib do_open 传入的 timeout，专用于连接阶段
+        super().__init__(*args, **kw)
+        self._read_timeout = read_timeout
+
+    def connect(self):
+        super().connect()
+        if self.sock is not None:
+            self.sock.settimeout(self._read_timeout)
+
+
+class _TimeoutHTTPSHandler(urllib.request.HTTPSHandler):
+    """把 connect/read 超时拆开的 urllib handler（默认 connect 30s + read 120s）。"""
+
+    def __init__(self, connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT):
+        super().__init__()
+        self._connect_timeout = connect_timeout
+        self._read_timeout = read_timeout
+
+    def https_open(self, req):
+        return self.do_open(_SplitTimeoutHTTPSConnection, req,
+                            connect_timeout=self._connect_timeout,
+                            read_timeout=self._read_timeout)
+
+
+def chat(base, key, model, text, connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT):
+    """调用 DeepSeek chat/completions，返回译文。
+    - 修复A：请求体显式关闭深度推理（thinking.enabled=false），翻译任务不需要推理，避免单次 1~3 分钟；
+    - 修复D：max_tokens 按输入长度动态估算（min(3000, max(1200, len*0.8))），降低长块截断概率；
+    - 修复A：超时拆分为 connect/read 两段，默认 connect 30s + read 120s。"""
+    body = {
+        "model": model,
+        "messages": [{"role": "system", "content": SYSTEM},
+                     {"role": "user", "content": text}],
+        "temperature": 0.2,
+        "thinking": {"type": "disabled"},
+        "max_tokens": min(3000, max(1200, int(len(text) * 0.8))),
+    }
     req = urllib.request.Request(
         f"{base}/chat/completions",
-        data=json.dumps({
-            "model": model,
-            "messages": [{"role": "system", "content": SYSTEM},
-                         {"role": "user", "content": text}],
-            "temperature": 0.2,
-            "max_tokens": 3000,
-        }).encode("utf-8"),
+        data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
     )
-    with urllib.request.urlopen(req, timeout=180) as r:
-        data = json.loads(r.read().decode("utf-8"))
+    opener = urllib.request.build_opener(
+        _TimeoutHTTPSHandler(connect_timeout=connect_timeout, read_timeout=read_timeout))
+    try:
+        with opener.open(req) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[chat] 调用失败 {type(e).__name__}: {e}", flush=True)
+        raise
     return data["choices"][0]["message"]["content"].strip()
 
 
@@ -474,26 +525,107 @@ class PdfTranslatorEngine:
 
     @staticmethod
     def _restore_placeholders(text, ph):
-        """将译文中的占位符还原为原始 LaTeX 片段。"""
-        def _rp(m):
-            idx = int(m.group(1))
-            return ph[idx] if idx < len(ph) else m.group(0)
-        return re.sub(r"__KIRA_PH_(\d+)__", _rp, text)
+        """将译文中的占位符还原为原始 LaTeX 片段；存在越界/缺失占位符时返回 None 表示还原失败。"""
+        ok = True
 
-    def _chat_retry(self, base, key, model, text):
-        """调 DeepSeek 翻译，失败重试 RETRIES 次；全部失败返回 None。"""
+        def _rp(m):
+            nonlocal ok
+            idx = int(m.group(1))
+            if idx < len(ph):
+                return ph[idx]
+            ok = False
+            return m.group(0)
+
+        out = re.sub(r"__KIRA_PH_(\d+)__", _rp, text)
+        return out if ok else None
+
+    @staticmethod
+    def _is_translatable_line(orig_line, protected, ph):
+        """正文行判定：基于还原后的原文判断是否含可翻译英文单词（[A-Za-z]{2,}）。
+        空行/注释/行首命令/全占位符/无空格宏片段/key=value 参数行/TikZ 路径片段/已含中文的行
+        一律不译（原样保留）。"""
+        s = orig_line.strip()
+        if not s or s.startswith("%") or s.startswith("\\"):
+            return False                      # 空行 / 注释 / 行首命令一律不译
+        # 输入行本身命中废话特征（污染残留/规则复述）→ 不译
+        if PdfTranslatorEngine.GARBAGE_RE.search(s):
+            return False
+        # 已含大量中文的行（废话/已翻译行）不再送去翻译：LaTeX 英文论文正文行不会以中文为主
+        cjk = len(re.findall(r"[\u4e00-\u9fff]", s))
+        ascii_letters = len(re.findall(r"[A-Za-z]", s))
+        if cjk > 0 and cjk >= ascii_letters:
+            return False
+        body = re.sub(r"__KIRA_(?:PH|CAP)_\d+__", "", protected)
+        body = body.strip(" \t,;{}[]()%")     # 去掉残余符号
+        if not body or not re.search(r"\s", body):
+            return False                      # 全占位符 / 无空格的宏片段 → 不译
+        # key=value 参数/样式定义行（如 box/.style=、line width=1pt）→ 不译
+        body_main = body.split("%")[0].rstrip(" \t,").strip()
+        m = re.match(r"^([A-Za-z0-9][A-Za-z0-9 ./_\-]*?)\s*=\s*([^,;{}()%]*?)\s*$", body_main)
+        if m and not re.search(r"\s", m.group(2)):
+            return False
+        # TikZ 路径/坐标片段（含 -- 连接符）→ 不译
+        if re.search(r"\s--\s", body):
+            return False
+        restored = PdfTranslatorEngine._restore_placeholders(protected, ph)
+        if restored is None:
+            return False
+        return bool(re.search(r"[A-Za-z]{2,}", restored))  # 还原后必须含可翻译英文单词
+
+    # 废话特征：meta 回复关键词（真正的 LaTeX 译文几乎不会出现这些词）
+    GARBAGE_RE = re.compile(
+        # 已剔除与 SYSTEM 提示词重叠的关键词（占位符/术语表/请提供），避免规则复述被误杀
+        r"请粘贴|您提供|未检测到|未发现|已理解|已准备|翻译规则|规则说明|规则如下|我收到|统一翻译"
+    )
+
+    @classmethod
+    def _is_garbage(cls, t):
+        """启发式无效输出检测（收紧版，防误杀）：命中 meta 废话关键词 + 中文占比 > 50%
+        + 无任何 LaTeX 命令（\\cmd）才判废；真正的 LaTeX 译文通常含 \\cite/\\ref 等命令，
+        或 ASCII 占比高，不会误杀。匹配前先压缩空白，防止关键词被换行拆开。"""
+        if not t or not t.strip():
+            return True
+        compact = re.sub(r"\s+", "", t)
+        if not cls.GARBAGE_RE.search(compact):
+            return False
+        cjk = len(re.findall(r"[\u4e00-\u9fff]", compact))
+        ascii_letters = len(re.findall(r"[A-Za-z]", compact))
+        if cjk <= ascii_letters:                     # 中文占比必须 > 50%
+            return False
+        if re.search(r"\\[A-Za-z@]+", compact):      # 含 LaTeX 命令 → 不是废话
+            return False
+        return True
+
+    def _chat_retry(self, base, key, model, text,
+                    max_attempts=RETRY_MAX_ATTEMPTS, budget=RETRY_BUDGET):
+        """调 DeepSeek 翻译，失败/废话最多尝试 max_attempts 次、单块总耗时 ≤ budget 秒；
+        超预算/全部失败返回 None（调用方写回原行），避免单块无限拖时间。"""
         last_err = None
-        for attempt in range(RETRIES):
+        deadline = time.monotonic() + budget
+        for attempt in range(max_attempts):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print(f"[FAIL] 单块时间预算({budget:.0f}s)耗尽，放弃本块", flush=True)
+                break
             try:
-                return chat(base, key, model, text)
+                out = chat(
+                    base, key, model,
+                    "以下是待翻译的 LaTeX 片段（占位符代表原样保留的命令/结构）：\n\n" + text,
+                )
+                if self._is_garbage(out):
+                    last_err = RuntimeError(f"第{attempt + 1}次输出疑似废话: {out[:80]!r}")
+                    print(f"[RETRY {attempt + 1}] 废话检测命中: {out[:80]!r}", flush=True)
+                    time.sleep(min(2 * (attempt + 1), remaining))
+                    continue
+                return out
             except Exception as e:
                 last_err = e
                 print(f"[RETRY {attempt + 1}] {type(e).__name__}: {e}", flush=True)
-                time.sleep(2 * (attempt + 1))
+                time.sleep(min(2 * (attempt + 1), remaining))
         print(f"[FAIL] {last_err}", flush=True)
         return None
 
-    def _translate_tex_content(self, tex_text, base, key, model, limit=0):
+    def _translate_tex_content(self, tex_text, base, key, model, limit=0, on_block=None):
         """翻译 .tex 正文：保护 LaTeX 结构，\\caption 内容强制翻译。返回 (译文或 None, 说明)。"""
         out_lines = []
         pending = []    # (out_idx, protected_text, ph)
@@ -516,8 +648,8 @@ class PdfTranslatorEngine:
             parts.append(line[pos:])
             masked = "".join(parts)
             protected, ph = self._protect_latex_line(masked)
-            body = re.sub(r"__KIRA_(?:PH|CAP)_\d+__", "", protected)
-            if body.strip() and not protected.strip().startswith("\\"):
+            # 修复1：基于还原后的原文判定是否含可翻译英文正文；纯命令/占位块一律不译
+            if self._is_translatable_line(line, protected, ph):
                 pending.append((len(out_lines), protected, ph))
                 out_lines.append(None)
             else:
@@ -528,65 +660,72 @@ class PdfTranslatorEngine:
             skipped = pending[limit:]   # 被截断不译的块：还原原文占位，避免 out_lines 残留 None（join 崩溃）
             pending = pending[:limit]
             for idx, text, ph in skipped:
-                out_lines[idx] = self._restore_placeholders(text, ph)
+                restored = self._restore_placeholders(text, ph)
+                out_lines[idx] = text if restored is None else restored
         rows = {}
         if pending:
             blocks, cur, cur_len = [], [], 0
             for (idx, text, _ph) in pending:
                 ln = len(text) + 1
-                if cur and cur_len + ln > 4500:
+                if cur and cur_len + ln > BLOCK_LIMIT:
                     blocks.append(cur)
                     cur, cur_len = [], 0
                 cur.append((idx, text))
                 cur_len += ln
             if cur:
                 blocks.append(cur)
-            for blk in blocks:
+            for bi, blk in enumerate(blocks, 1):
                 block_text = "\n".join(t for _, t in blk)
                 tr = self._chat_retry(base, key, model, block_text)
-                if tr is None:
-                    return None, f"正文翻译失败：{block_text[:120]}"
-                bt = tr.split("\n")
-                if len(bt) != len(blk):
-                    bt = []
-                    for _, t in blk:
-                        one = self._chat_retry(base, key, model, t)
-                        if one is None:
-                            return None, f"逐行翻译失败：{t[:120]}"
-                        bt.append(one)
+                bt = None
+                if tr is not None:
+                    bt = tr.split("\n")
+                if tr is None or len(bt) != len(blk):
+                    # 修复3：块级失败/行数不符 → 整块写回原文（保护后原行），不再逐行重译
+                    print(f"[translate] 块级行数不符({-1 if bt is None else len(bt)} vs {len(blk)})，整块写回原文",
+                          flush=True)
+                    bt = [t for _, t in blk]
                 for (idx, _t), tline in zip(blk, bt):
                     rows[idx] = tline
+                if on_block:                     # 修复B：正文块级进度回调（每块一次）
+                    on_block(bi, len(blocks))
             for idx, text, ph in pending:
-                out_lines[idx] = self._restore_placeholders(rows[idx], ph)
+                out_line = rows.get(idx, text)
+                if out_line is None:
+                    out_line = text
+                # 写回前护栏：废话特征 或 占位符缺失（输入占位符多于输出）→ 用保护后的原行
+                if self._is_garbage(out_line) or out_line.count("__KIRA_PH_") < text.count("__KIRA_PH_"):
+                    out_line = text
+                restored = self._restore_placeholders(out_line, ph)
+                out_lines[idx] = out_line if restored is None else restored
 
-        # ---- 翻译 caption 内容（合并一块，行数不符回退逐条） ----
+        # ---- 翻译 caption 内容（合并一块；失败/行数不符回退原文内容，不逐条重译） ----
         if captions:
             blocks, cur, cur_len = [], [], 0
             for (idx, holder, prefix, content, suffix) in captions:
-                if cur and cur_len + len(content) + 1 > 4500:
+                if cur and cur_len + len(content) + 1 > BLOCK_LIMIT:
                     blocks.append(cur)
                     cur, cur_len = [], 0
                 cur.append((idx, holder, content))
                 cur_len += len(content) + 1
             if cur:
                 blocks.append(cur)
-            for blk in blocks:
+            for bi, blk in enumerate(blocks, 1):
                 block_text = "\n".join(c for _, _, c in blk)
                 tr = self._chat_retry(base, key, model, block_text)
-                if tr is None:
-                    return None, f"caption 翻译失败：{block_text[:120]}"
-                ct = tr.split("\n")
-                if len(ct) != len(blk):
-                    ct = []
-                    for _, _, c in blk:
-                        one = self._chat_retry(base, key, model, c)
-                        if one is None:
-                            return None, f"caption 逐条翻译失败：{c[:120]}"
-                        ct.append(one)
+                ct = None
+                if tr is not None:
+                    ct = tr.split("\n")
+                if tr is None or len(ct) != len(blk):
+                    print(f"[translate] caption 块行数不符({-1 if ct is None else len(ct)} vs {len(blk)})，回退原文内容",
+                          flush=True)
+                    ct = [c for _, _, c in blk]
                 for (idx, holder, _c), tline in zip(blk, ct):
                     if out_lines[idx] is None:
                         out_lines[idx] = ""
                     out_lines[idx] = out_lines[idx].replace(holder, tline)
+                if on_block:                     # 修复B：caption 块级进度回调（每块一次）
+                    on_block(bi, len(blocks))
 
         safe = ["\n" if ln is None else ln for ln in out_lines]  # join 前兜底过滤 None
         return "\n".join(safe), f"翻译 {len(pending)} 正文行 / {len(captions)} 条 caption"
@@ -645,8 +784,43 @@ class PdfTranslatorEngine:
         shutil.copy(src_pdf, out_pdf)
         return pages, out_pdf
 
+    @staticmethod
+    def _is_pure_command_tex(text):
+        """纯命令文件判定：所有非空非注释行都以 \\ 开头（如 math_commands.tex 全为 \\newcommand）。
+        这类文件整体跳过翻译，避免把样式定义误当正文。"""
+        for ln in text.split("\n"):
+            s = ln.strip()
+            if not s or s.startswith("%"):
+                continue
+            if not s.startswith("\\"):
+                return False
+        return True
+
+    @staticmethod
+    def _sanity_check_translated(original, translated, path):
+        """编译前结构护栏：document 环境数量不变；preamble 出现非 LaTeX 中文段落 → 中止并保留现场。"""
+        for env in ("\\begin{document}", "\\end{document}"):
+            if translated.count(env) != original.count(env):
+                raise RuntimeError(
+                    f"结构护栏: {path} 中 {env} 数量变化"
+                    f"({original.count(env)} -> {translated.count(env)})，疑似污染，中止"
+                )
+        if "\\documentclass" in translated:
+            pre = translated.split("\\begin{document}")[0]
+            for ln in pre.split("\n"):
+                s = ln.strip()
+                if not s or s.startswith("%") or s.startswith("\\"):
+                    continue
+                s_main = s.split("%", 1)[0].strip()   # 剔除行内注释后再判断，避免 % 中文注释误报
+                if not s_main:
+                    continue
+                if re.search(r"[\u4e00-\u9fff]", s_main):
+                    raise RuntimeError(
+                        f"结构护栏: {path} preamble 出现非 LaTeX 中文段落: {s[:60]!r}，中止"
+                    )
+
     def run_tex(self, arxiv_id=None, tex_path=None, limit=0, lang="zh",
-                on_stage=None, on_progress=None):
+                on_stage=None, on_progress=None, on_files=None):
         """源码优先翻译：arXiv ID 或本地 tex 源码 → 定位根 tex → 保留原文档类注入
         ctex + hyperref[unicode] → 只翻译 \\input/\\include 的正文 tex（.bib/图片原样）
         → xelatex + bibtex 多遍编译 → 输出 {stem}_zh.pdf。"""
@@ -718,18 +892,71 @@ class PdfTranslatorEngine:
         if on_stage:
             on_stage("translate")
         total = len(tex_files)
+        if on_files:
+            on_files(total)
         for fi, tf in enumerate(tex_files):
             text = open(tf, encoding="utf-8", errors="ignore").read()
-            translated, note = self._translate_tex_content(text, base, key, self.model, limit=limit)
+            # 修复4：纯命令文件（\input/\include 的 \newcommand 定义文件等）整体跳过翻译
+            if self._is_pure_command_tex(text):
+                print(f"[run_tex] 纯命令文件跳过翻译: {os.path.relpath(tf, src_dir)}", flush=True)
+                if on_progress:
+                    on_progress(fi + 1, total)
+                continue
+            # 修复B：块级进度透传到 on_progress（每块一次）；块数为 0 的文件回退到文件级进度
+            reported_block = [False]
+
+            def _on_block(done, total_blocks):
+                reported_block[0] = True
+                if on_progress:
+                    on_progress(done, total_blocks)
+
+            translated, note = self._translate_tex_content(
+                text, base, key, self.model, limit=limit,
+                on_block=_on_block if on_progress else None,
+            )
             if translated is None:
                 raise RuntimeError(f"翻译失败: {tf}: {note}")
+            # 修复C：垃圾行占比 > 20% 才中止写回；少量命中仅告警并回退该行为原文，避免前功尽弃
+            orig_lines = text.split("\n")
+            nonempty = [ln for ln in translated.split("\n") if ln.strip()]
+            garbage = [ln for ln in nonempty if self._is_garbage(ln)]
+            if garbage:
+                ratio = len(garbage) / max(1, len(nonempty))
+                if ratio > GARBAGE_ABORT_RATIO:
+                    raise RuntimeError(
+                        f"翻译输出垃圾行占比 {ratio:.0%} > {GARBAGE_ABORT_RATIO:.0%}，"
+                        f"疑似废话污染，中止写回: {os.path.relpath(tf, src_dir)} "
+                        f"示例: {garbage[0][:80]!r}"
+                    )
+                tlines = translated.split("\n")
+                # 加固：回退前先校验 translated 与 orig_lines 行数是否一致。
+                # 翻译后行序/行数可能变化，若行数不一致，逐行按索引对齐回退会把
+                # 错误的原文行写进译文，故此时跳过硬回退，保留翻译结果并告警。
+                n_t = len(tlines)
+                n_o = len(orig_lines)
+                line_consistent = (n_t == n_o) or (
+                    max(n_t, n_o) > 0 and abs(n_t - n_o) <= max(1, 0.5 * max(n_t, n_o))
+                )
+                if line_consistent:
+                    print(f"[run_tex] 警告: {len(garbage)}/{len(nonempty)} 行命中垃圾特征"
+                          f"（占比 {ratio:.0%} ≤ 20%），回退为原文: {os.path.relpath(tf, src_dir)}",
+                          flush=True)
+                    for i, ln in enumerate(tlines):
+                        if ln.strip() and self._is_garbage(ln) and i < len(orig_lines):
+                            tlines[i] = orig_lines[i]
+                    translated = "\n".join(tlines)
+                else:
+                    print(f"[run_tex] 行数不一致({n_t} vs {n_o})，跳过逐行回退，保留翻译结果: "
+                          f"{os.path.relpath(tf, src_dir)}", flush=True)
+            # 修复4：结构护栏（document 环境数量不变、preamble 无中文废话段落）
+            self._sanity_check_translated(text, translated, os.path.relpath(tf, src_dir))
             # LaTeX 输出前 sanitize_unicode 清洗
             cleaned = "\n".join(sanitize_unicode(ln) for ln in translated.split("\n"))
             with open(tf, "w", encoding="utf-8") as f:
                 f.write(cleaned)
             print(f"[run_tex] 已翻译 {fi + 1}/{total}: {os.path.relpath(tf, src_dir)} ({note})",
                   flush=True)
-            if on_progress:
+            if on_progress and not reported_block[0]:
                 on_progress(fi + 1, total)
 
         # ---- 5. xelatex + bibtex 多遍编译 ----
