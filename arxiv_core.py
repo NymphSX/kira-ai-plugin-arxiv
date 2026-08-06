@@ -60,9 +60,13 @@ class ArxivClient:
         sort_by: str = "relevance",
         max_results: int = 5,
         user_agent: str = "",
+        temp_dir: Optional[Path] = None,
     ):
         self.download_dir = download_dir
         self.source_dir = source_dir
+        # 下载 .part 临时文件目录：优先 temp_dir（框架会定期清理 data/temp），
+        # 缺省回退到对应保存目录（兼容旧行为）
+        self.temp_dir = temp_dir
         self.timeout = timeout
         self.user_agent = (user_agent or "").strip() or DEFAULT_USER_AGENT
         self.sort_by = sort_by if sort_by in ("relevance", "submittedDate", "lastUpdatedDate") else "relevance"
@@ -139,20 +143,46 @@ class ArxivClient:
     async def _api_query(self, params: dict) -> List[dict]:
         global _last_api_call
         timeout = self.timeout
+        # 限流/服务端错误重试：429/5xx → 指数退避，最多 3 次
+        max_retries = 3
+        last_exc: Optional[Exception] = None
         async with _api_lock:
             now = time.monotonic()
             wait = MIN_API_INTERVAL - (now - _last_api_call)
             if wait > 0:
                 await asyncio.sleep(wait)
-            try:
-                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
-                                             headers={"User-Agent": self.user_agent}) as client:
-                    resp = await client.get(API_BASE, params=params)
+            for attempt in range(max_retries):
+                try:
+                    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
+                                                 headers={"User-Agent": self.user_agent}) as client:
+                        resp = await client.get(API_BASE, params=params)
+                    if resp.status_code in (429,) or resp.status_code >= 500:
+                        last_exc = ArxivApiError(f"HTTP {resp.status_code}")
+                        retry_after = 0.0
+                        ra = resp.headers.get("Retry-After")
+                        if ra:
+                            try:
+                                retry_after = float(ra)
+                            except ValueError:
+                                retry_after = 0.0
+                        backoff = max(retry_after, 2 ** (attempt + 1))  # 2s/4s/8s 指数退避
+                        print(f"[arxiv] HTTP {resp.status_code}，{backoff:.0f}s 后重试 "
+                              f"({attempt + 1}/{max_retries})", flush=True)
+                        await asyncio.sleep(backoff)
+                        continue
                     resp.raise_for_status()
                     content = resp.content
-                _last_api_call = time.monotonic()
-            except httpx.HTTPError as e:
-                raise ArxivApiError(f"arXiv API 请求失败: {e}") from e
+                    _last_api_call = time.monotonic()
+                    break
+                except httpx.HTTPError as e:
+                    last_exc = e
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+            else:
+                raise ArxivApiError(
+                    f"arXiv API 请求失败（重试 {max_retries} 次后仍失败）: {last_exc}"
+                ) from last_exc
         try:
             root = ET.fromstring(content)
         except ET.ParseError as e:
@@ -213,6 +243,9 @@ class ArxivClient:
         safe_id = self.sanitize_id(arxiv_id)
         save_dir = self.download_dir
         save_dir.mkdir(parents=True, exist_ok=True)
+        # .part 临时文件放 temp_dir（data/temp，框架自动清理），完成后 os.replace 到最终目录
+        tmp_dir = self.temp_dir or save_dir
+        tmp_dir.mkdir(parents=True, exist_ok=True)
         final_path = save_dir / f"{safe_id}.pdf"
         url = f"{PDF_BASE}{arxiv_id}"
         timeout = self.timeout * 2
@@ -225,7 +258,7 @@ class ArxivClient:
                     async with client.stream("GET", url) as resp:
                         resp.raise_for_status()
                         fd, tmp_name = tempfile.mkstemp(
-                            prefix=f".{safe_id}.", suffix=".part", dir=str(save_dir)
+                            prefix=f".{safe_id}.", suffix=".part", dir=str(tmp_dir)
                         )
                         tmp_path = Path(tmp_name)
                         size = 0
@@ -285,6 +318,9 @@ class ArxivClient:
         safe_id = self.sanitize_id(arxiv_id)
         save_dir = self.source_dir
         save_dir.mkdir(parents=True, exist_ok=True)
+        # .part 临时文件放 temp_dir（data/temp，框架自动清理），完成后 os.replace 到最终目录
+        tmp_dir = self.temp_dir or save_dir
+        tmp_dir.mkdir(parents=True, exist_ok=True)
         url = f"https://arxiv.org/e-print/{arxiv_id}"
         timeout = self.timeout * 2
 
@@ -299,7 +335,7 @@ class ArxivClient:
                         resp.raise_for_status()
                         content_type = resp.headers.get("content-type", "")
                         fd, tmp_name = tempfile.mkstemp(
-                            prefix=f".{safe_id}.", suffix=".part", dir=str(save_dir)
+                            prefix=f".{safe_id}.", suffix=".part", dir=str(tmp_dir)
                         )
                         tmp_path = Path(tmp_name)
                         with os.fdopen(fd, "wb") as fh:

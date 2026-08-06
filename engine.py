@@ -86,7 +86,8 @@ def load_cfg(root=None, provider_id="deepseek-main", base_url=None, api_key=None
                 "找不到 KiraAI 根目录（data/config/system_config.json）。"
                 "请设置环境变量 KIRAAI_ROOT 或 KIRAAI_BASE_URL/KIRAAI_API_KEY。"
             )
-        d = json.load(open(os.path.join(root, "data/config/system_config.json"), encoding="utf-8"))
+        with open(os.path.join(root, "data/config/system_config.json"), encoding="utf-8") as fh:
+            d = json.load(fh)
         prov = d.get("providers", {}).get(provider_id)
         if prov is None:
             raise RuntimeError(f"system_config.json 中未找到 provider: {provider_id}")
@@ -126,11 +127,40 @@ class _TimeoutHTTPSHandler(urllib.request.HTTPSHandler):
                             read_timeout=self._read_timeout)
 
 
+# ---- 请求工厂：请求头 / opener 预先备好并缓存，避免每次调用重建 ----
+# opener 按 (connect_timeout, read_timeout) 缓存；headers 按 api_key 缓存。
+# 均为只读多写少的 dict，CPython GIL 下 get/set 原子；opener 并发 open 线程安全。
+_opener_cache = {}
+_headers_cache = {}
+
+
+def _get_opener(connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT):
+    """按超时参数复用预构建的 urllib opener。"""
+    key = (connect_timeout, read_timeout)
+    op = _opener_cache.get(key)
+    if op is None:
+        op = urllib.request.build_opener(
+            _TimeoutHTTPSHandler(connect_timeout=connect_timeout,
+                                 read_timeout=read_timeout))
+        _opener_cache[key] = op
+    return op
+
+
+def _get_headers(api_key):
+    """按 api_key 复用预构建的请求头（Key 不变时不重复构造 dict）。"""
+    h = _headers_cache.get(api_key)
+    if h is None:
+        h = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        _headers_cache[api_key] = h
+    return h
+
+
 def chat(base, key, model, text, connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT):
     """调用 DeepSeek chat/completions，返回译文。
     - 修复A：请求体显式关闭深度推理（thinking.enabled=false），翻译任务不需要推理，避免单次 1~3 分钟；
     - 修复D：max_tokens 按输入长度动态估算（min(3000, max(1200, len*0.8))），降低长块截断概率；
-    - 修复A：超时拆分为 connect/read 两段，默认 connect 30s + read 120s。"""
+    - 修复A：超时拆分为 connect/read 两段，默认 connect 30s + read 120s；
+    - 请求头 / opener 预先备好并缓存（_get_headers / _get_opener），避免每次调用重建。"""
     body = {
         "model": model,
         "messages": [{"role": "system", "content": SYSTEM},
@@ -142,12 +172,10 @@ def chat(base, key, model, text, connect_timeout=CONNECT_TIMEOUT, read_timeout=R
     req = urllib.request.Request(
         f"{base}/chat/completions",
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+        headers=_get_headers(key),
     )
-    opener = urllib.request.build_opener(
-        _TimeoutHTTPSHandler(connect_timeout=connect_timeout, read_timeout=read_timeout))
     try:
-        with opener.open(req) as r:
+        with _get_opener(connect_timeout, read_timeout).open(req) as r:
             data = json.loads(r.read().decode("utf-8"))
     except Exception as e:
         print(f"[chat] 调用失败 {type(e).__name__}: {e}", flush=True)
@@ -352,12 +380,57 @@ _MATH_UNI = {
     "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
 }
 
-def sanitize_unicode(text):
-    """编译前清洗进入 LaTeX 的文本：数学符号→LaTeX、引号规范；emoji/私用区/不可打印字符删除或替换并告警。"""
+# 数学特征字符：希腊字母 / 数学运算符符号 / Unicode 下标上标
+_GREEK_RE = re.compile(r"[\u0370-\u03ff\u1f00-\u1fff]")
+_MATH_OPS_RE = re.compile(r"[=+\-−×÷≤≥≠±√∑∏∫∈⊂⊃∪∩∞∂∇≈≡⇒⇔→←↑↓]")
+_WORD_RE = re.compile(r"[A-Za-z]{3,}")
+
+
+def protect_math(text):
+    """把明显的公式行用 $...$ 包裹，防止被翻译模型当正文乱译。
+    判定（保守，避免误伤普通句子）：
+      - 行内含希腊字母（学术论文中几乎只出现在公式）；
+      - 或含数学运算符且不含连续英文单词（≥3 字母），如 "E = mc2"、"xi + xj"。
+    已是 $...$ 或以 \\ 开头的行不处理。"""
     if not text:
         return text
+    out = []
+    for ln in (text or "").split("\n"):
+        s = ln.strip()
+        if (s and not s.startswith("$") and not s.startswith("\\")
+                and (_GREEK_RE.search(s)
+                     or (_MATH_OPS_RE.search(s) and not _WORD_RE.search(s)))):
+            out.append(f"${s}$")
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
+def sanitize_unicode(text):
+    """编译前清洗进入 LaTeX 的文本：数学符号→LaTeX、引号规范；emoji/私用区/不可打印字符删除或替换并告警。
+    $...$ 数学段内符号转成不带 $ 的 LaTeX 命令（避免嵌套数学模式）。"""
+    if not text:
+        return text
+    # 先暂存 $...$ 数学段，段内符号转成裸 LaTeX 命令
+    math_holders = []
+
+    def _hold(m):
+        seg = m.group(0)[1:-1]
+        seg_out = []
+        for ch in seg:
+            if ch in _MATH_UNI:
+                seg_out.append(_MATH_UNI[ch].strip("$"))
+            else:
+                seg_out.append(ch)
+        math_holders.append("$" + "".join(seg_out) + "$")
+        return f"\x00S{len(math_holders) - 1}\x00"
+
+    t = re.sub(r"\$[^$]*\$", _hold, str(text))
     out, warn = [], 0
-    for ch in text:
+    for ch in t:
+        if ch == "\x00":      # 数学段哨兵，原样保留以便还原
+            out.append(ch)
+            continue
         if ch in _MATH_UNI:
             out.append(_MATH_UNI[ch]); continue
         o = ord(ch)
@@ -370,9 +443,12 @@ def sanitize_unicode(text):
             out.append("{\\bfseries 注意：}")
             continue
         out.append(ch)
+    result = "".join(out)
+    for i, h in enumerate(math_holders):
+        result = result.replace(f"\x00S{i}\x00", h)
     if warn:
         print(f"[sanitize_unicode] 替换/删除 {warn} 个特殊 Unicode 字符", flush=True)
-    return "".join(out)
+    return result
 
 
 class PdfTranslatorEngine:
@@ -490,14 +566,29 @@ class PdfTranslatorEngine:
 
     @staticmethod
     def _inject_preamble(main_tex):
-        """在根 tex 的 \\documentclass 行后注入 ctex + hyperref(unicode)，重复调用去重。"""
+        """在根 tex 的 \\documentclass 行后注入 ctex，hyperref 选项通过
+        \\PassOptionsToPackage 在 ctex 前传递（ctex 内部加载 hyperref，直接
+        \\usepackage{hyperref} 会导致选项冲突）。重复调用去重。"""
         p = str(main_tex)
         text = open(p, encoding="utf-8", errors="ignore").read()
         lines = text.split("\n")
+
+        # 1. 删除原 preamble 中任何显式 \usepackage[...]{hyperref} 行
+        #    （ctex 内部会加载 hyperref，重复加载会导致选项冲突）
+        new_lines = []
+        for ln in lines:
+            s = ln.strip()
+            if (s.startswith("\\usepackage") and "hyperref" in s
+                    and "PassOptionsToPackage" not in s):
+                continue  # 删掉
+            new_lines.append(ln)
+        lines = new_lines
+
+        # 2. 在 \documentclass 后注入 PassOptionsToPackage + ctex
         have = set(lines)
         inject = [
+            "\\PassOptionsToPackage{unicode=true,pdfencoding=auto,psdextra}{hyperref}",
             "\\usepackage[UTF8,fontset=fandol]{ctex}",
-            "\\usepackage[unicode=true,pdfencoding=auto,psdextra]{hyperref}",
         ]
         add = [x for x in inject if not any(x in h for h in have)]
         if add:
@@ -625,7 +716,37 @@ class PdfTranslatorEngine:
         print(f"[FAIL] {last_err}", flush=True)
         return None
 
-    def _translate_tex_content(self, tex_text, base, key, model, limit=0, on_block=None):
+    # ---- 断点续翻缓存（源码优先翻译路线） ----
+    @staticmethod
+    def _load_tex_cache(cache_path):
+        """加载源码翻译断点缓存（块 md5 -> 译文行列表）。文件缺失/损坏返回空 dict。"""
+        if not cache_path or not os.path.exists(cache_path):
+            return {}
+        try:
+            with open(cache_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _save_tex_cache(cache_path, cache):
+        """原子落盘断点缓存（临时文件 + os.replace），避免进程崩溃损坏缓存。"""
+        if not cache_path:
+            return
+        try:
+            d = os.path.dirname(cache_path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            tmp = cache_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(cache, fh, ensure_ascii=False)
+            os.replace(tmp, cache_path)
+        except Exception as e:
+            print(f"[cache] 断点缓存写入失败: {e}", flush=True)
+
+    def _translate_tex_content(self, tex_text, base, key, model, limit=0, on_block=None,
+                               cache=None, cache_path=None):
         """翻译 .tex 正文：保护 LaTeX 结构，\\caption 内容强制翻译。返回 (译文或 None, 说明)。"""
         out_lines = []
         pending = []    # (out_idx, protected_text, ph)
@@ -676,15 +797,25 @@ class PdfTranslatorEngine:
                 blocks.append(cur)
             for bi, blk in enumerate(blocks, 1):
                 block_text = "\n".join(t for _, t in blk)
-                tr = self._chat_retry(base, key, model, block_text)
-                bt = None
-                if tr is not None:
-                    bt = tr.split("\n")
-                if tr is None or len(bt) != len(blk):
-                    # 修复3：块级失败/行数不符 → 整块写回原文（保护后原行），不再逐行重译
-                    print(f"[translate] 块级行数不符({-1 if bt is None else len(bt)} vs {len(blk)})，整块写回原文",
-                          flush=True)
-                    bt = [t for _, t in blk]
+                # 断点续翻：块 md5 命中缓存则直接复用，不再调 LLM
+                block_key = hashlib.md5(block_text.encode("utf-8")).hexdigest()
+                cached = (cache or {}).get(block_key)
+                if cached is not None:
+                    bt = cached
+                    print(f"[cache] 命中正文块 {bi}/{len(blocks)}（{len(bt)} 行），跳过", flush=True)
+                else:
+                    tr = self._chat_retry(base, key, model, block_text)
+                    bt = None
+                    if tr is not None:
+                        bt = tr.split("\n")
+                    if tr is None or len(bt) != len(blk):
+                        # 修复3：块级失败/行数不符 → 整块写回原文（保护后原行），不再逐行重译
+                        print(f"[translate] 块级行数不符({-1 if bt is None else len(bt)} vs {len(blk)})，整块写回原文",
+                              flush=True)
+                        bt = [t for _, t in blk]
+                    elif cache is not None:
+                        cache[block_key] = bt
+                        self._save_tex_cache(cache_path, cache)
                 for (idx, _t), tline in zip(blk, bt):
                     rows[idx] = tline
                 if on_block:                     # 修复B：正文块级进度回调（每块一次）
@@ -712,14 +843,24 @@ class PdfTranslatorEngine:
                 blocks.append(cur)
             for bi, blk in enumerate(blocks, 1):
                 block_text = "\n".join(c for _, _, c in blk)
-                tr = self._chat_retry(base, key, model, block_text)
-                ct = None
-                if tr is not None:
-                    ct = tr.split("\n")
-                if tr is None or len(ct) != len(blk):
-                    print(f"[translate] caption 块行数不符({-1 if ct is None else len(ct)} vs {len(blk)})，回退原文内容",
-                          flush=True)
-                    ct = [c for _, _, c in blk]
+                # 断点续翻：caption 块 md5 命中缓存则直接复用
+                block_key = hashlib.md5(block_text.encode("utf-8")).hexdigest()
+                cached = (cache or {}).get(block_key)
+                if cached is not None:
+                    ct = cached
+                    print(f"[cache] 命中 caption 块 {bi}/{len(blocks)}（{len(ct)} 行），跳过", flush=True)
+                else:
+                    tr = self._chat_retry(base, key, model, block_text)
+                    ct = None
+                    if tr is not None:
+                        ct = tr.split("\n")
+                    if tr is None or len(ct) != len(blk):
+                        print(f"[translate] caption 块行数不符({-1 if ct is None else len(ct)} vs {len(blk)})，回退原文内容",
+                              flush=True)
+                        ct = [c for _, _, c in blk]
+                    elif cache is not None:
+                        cache[block_key] = ct
+                        self._save_tex_cache(cache_path, cache)
                 for (idx, holder, _c), tline in zip(blk, ct):
                     if out_lines[idx] is None:
                         out_lines[idx] = ""
@@ -748,36 +889,33 @@ class PdfTranslatorEngine:
                             pass
         stem = os.path.splitext(os.path.basename(main_tex))[0]
         tex_name = stem + ".tex"
-        old = os.getcwd()
-        os.chdir(work_dir)
         log = ""
         pages = None
-        try:
-            def _run_xelatex():
-                return subprocess.run(
-                    ["xelatex", "-interaction=nonstopmode", "-halt-on-error", tex_name],
-                    capture_output=True, text=True, timeout=900)
+        def _run_xelatex():
+            return subprocess.run(
+                ["xelatex", "-interaction=nonstopmode", "-halt-on-error", tex_name],
+                capture_output=True, text=True, timeout=900, cwd=work_dir)
 
-            r = _run_xelatex()                      # 第 1 遍
+        r = _run_xelatex()                      # 第 1 遍
+        log = (r.stdout or "") + (r.stderr or "")
+        aux = os.path.join(work_dir, stem + ".aux")
+        if os.path.exists(aux):
+            with open(aux, encoding="utf-8", errors="ignore") as fh:
+                aux_text = fh.read()
+            if "\\bibdata" in aux_text and shutil.which("bibtex"):
+                subprocess.run(["bibtex", stem], capture_output=True, text=True, timeout=300,
+                               cwd=work_dir)
+        for _i in range(2):                     # 第 2-3 遍（含引用/目录稳定）
+            r = _run_xelatex()
             log = (r.stdout or "") + (r.stderr or "")
-            aux = os.path.join(work_dir, stem + ".aux")
-            if os.path.exists(aux):
-                aux_text = open(aux, encoding="utf-8", errors="ignore").read()
-                if "\\bibdata" in aux_text and shutil.which("bibtex"):
-                    subprocess.run(["bibtex", stem], capture_output=True, text=True, timeout=300)
-            for _i in range(2):                     # 第 2-3 遍（含引用/目录稳定）
-                r = _run_xelatex()
-                log = (r.stdout or "") + (r.stderr or "")
-                if "Output written on" in log:
-                    # 新版格式: Output written on main.pdf (1 page). / 旧版: Output written on 1 page (...)
-                    m = re.search(r"Output written on [^(\n]*\((\d+) page", log)
-                    if m:
-                        pages = int(m.group(1))
-                    break
-            if "Output written on" not in log:
-                raise RuntimeError("xelatex 编译失败（未输出 'Output written on'）：\n" + log[-1500:])
-        finally:
-            os.chdir(old)
+            if "Output written on" in log:
+                # 新版格式: Output written on main.pdf (1 page). / 旧版: Output written on 1 page (...)
+                m = re.search(r"Output written on [^(\n]*\((\d+) page", log)
+                if m:
+                    pages = int(m.group(1))
+                break
+        if "Output written on" not in log:
+            raise RuntimeError("xelatex 编译失败（未输出 'Output written on'）：\n" + log[-1500:])
         src_pdf = os.path.join(work_dir, stem + ".pdf")
         if not os.path.exists(src_pdf):
             raise RuntimeError("xelatex 未生成 PDF 文件")
@@ -894,6 +1032,9 @@ class PdfTranslatorEngine:
         total = len(tex_files)
         if on_files:
             on_files(total)
+        # 断点续翻：任务级缓存（跨文件共享），存到 work_dir，进程重启后可续翻
+        cache_path = os.path.join(work_dir, "translation_cache.json")
+        cache = self._load_tex_cache(cache_path)
         for fi, tf in enumerate(tex_files):
             text = open(tf, encoding="utf-8", errors="ignore").read()
             # 修复4：纯命令文件（\input/\include 的 \newcommand 定义文件等）整体跳过翻译
@@ -913,6 +1054,7 @@ class PdfTranslatorEngine:
             translated, note = self._translate_tex_content(
                 text, base, key, self.model, limit=limit,
                 on_block=_on_block if on_progress else None,
+                cache=cache, cache_path=cache_path,
             )
             if translated is None:
                 raise RuntimeError(f"翻译失败: {tf}: {note}")
@@ -967,10 +1109,12 @@ class PdfTranslatorEngine:
         pages, out_pdf = self._compile_tex_multi(str(src_dir), str(main_tex), out_pdf)
 
         pages_txt = f", {pages} 页" if pages else ""
+        cache_note = f"断点续翻缓存 {len(cache)} 块" if cache else "断点续翻缓存（全新翻译）"
         return (
             f"源码优先翻译完成（run_tex）\n"
             f"- 翻译 tex: {total} 个文件\n"
             f"- PDF: {out_pdf} ({os.path.getsize(out_pdf)} bytes{pages_txt})\n"
+            f"- {cache_note}: {cache_path}\n"
             f"- 说明: 保留原文档类，注入 ctex + hyperref[unicode=true]，"
             f"xelatex + bibtex 多遍编译"
         )
@@ -1071,6 +1215,9 @@ class PdfTranslatorEngine:
             if on_progress:
                 on_progress(i + 1, total)
             typ, txt = merged[i]
+            # 公式保护：翻译前把明显的公式行用 $...$ 包裹，避免被当正文乱译
+            if typ == "para":
+                txt = protect_math(txt)
             key_id = hashlib.md5(f"{typ}\n{txt}".encode("utf-8")).hexdigest()
             if key_id in prog:
                 ok += 1
@@ -1102,11 +1249,22 @@ class PdfTranslatorEngine:
     # ---- MD → LaTeX → PDF（移植 build_pdf.py） ----
     @staticmethod
     def _esc(t):
-        t = str(t).replace("\\", "\\textbackslash{}")
+        # 先暂存 $...$ 数学段（公式里的 _ ^ \\ 等是 LaTeX 语法，不能被转义），转义后再还原。
+        # 哨兵用 \x00（PDF 提取文本不会含 NUL），避免被 _ \\ 等转义规则误伤。
+        math_holders = []
+
+        def _hold(m):
+            math_holders.append(m.group(0))
+            return f"\x00M{len(math_holders) - 1}\x00"
+
+        t = re.sub(r"\$[^$]*\$", _hold, str(t))
+        t = t.replace("\\", "\\textbackslash{}")
         for a, b in [("&", "\\&"), ("%", "\\%"), ("$", "\\$"), ("#", "\\#"),
                      ("_", "\\_"), ("{", "\\{"), ("}", "\\}"),
                      ("~", "\\textasciitilde{}"), ("^", "\\textasciicircum{}")]:
             t = t.replace(a, b)
+        for i, h in enumerate(math_holders):
+            t = t.replace(f"\x00M{i}\x00", h)
         return t
 
     def _latex_document(self, stem, secs):
@@ -1162,23 +1320,18 @@ class PdfTranslatorEngine:
             if os.path.exists(p):
                 os.remove(p)
 
-        old_cwd = os.getcwd()
-        os.chdir(work_dir)
-        try:
-            log = ""
-            ok = False
-            for i in range(3):   # 最多三遍编译生成目录
-                r = subprocess.run(
-                    ["xelatex", "-interaction=nonstopmode", os.path.basename(tex)],
-                    capture_output=True, text=True, timeout=600)
-                log = (r.stdout or "") + (r.stderr or "")
-                if "Output written on" in log:
-                    ok = True
-                    break
-            if not ok:
-                raise RuntimeError(f"xelatex 编译失败(3遍均未生成 PDF):\n" + log[-1500:])
-        finally:
-            os.chdir(old_cwd)
+        log = ""
+        ok = False
+        for i in range(3):   # 最多三遍编译生成目录
+            r = subprocess.run(
+                ["xelatex", "-interaction=nonstopmode", os.path.basename(tex)],
+                capture_output=True, text=True, timeout=600, cwd=work_dir)
+            log = (r.stdout or "") + (r.stderr or "")
+            if "Output written on" in log:
+                ok = True
+                break
+        if not ok:
+            raise RuntimeError(f"xelatex 编译失败(3遍均未生成 PDF):\n" + log[-1500:])
 
         src_pdf = os.path.join(work_dir, f"{stem}_zh.pdf")
         if not os.path.exists(src_pdf):

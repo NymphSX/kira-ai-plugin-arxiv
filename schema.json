@@ -12,7 +12,7 @@
   "model_type": "llm",
   "name": "翻译模型",
   "default": "",
-  "hint": "论文翻译（标题/摘要/LaTeX/PDF）使用的模型，格式 provider:model；留空=默认快速模型"
+  "hint": "标题/摘要翻译使用的模型，格式 provider:model；留空=默认快速模型。PDF 翻译模型请在下方「PDF 翻译」区域单独配置"
  },
  "request_timeout": {
   "type": "integer",
@@ -112,12 +112,12 @@
     "default": true,
     "hint": "关闭后 LLM 无法调用 pdf_translate 工具"
    },
-   "translation_model": {
+   "pdf_translation_model": {
     "type": "model_select",
     "model_type": "llm",
-    "name": "翻译模型",
+    "name": "PDF 翻译模型",
     "default": "",
-    "hint": "翻译使用的模型（provider:model）；留空=使用默认快速模型（ctx 默认快速 LLM 客户端），不硬编码第三方 provider"
+    "hint": "PDF 翻译使用的模型（provider:model）；留空=使用默认快速模型，不硬编码第三方 provider"
    },
    "model": {
     "type": "string",
@@ -162,6 +162,19 @@
     "name": "启用 Mineru 提取后端",
     "default": false,
     "hint": "false 时用 PyMuPDF 提取文本；true 时调用 Mineru（尚未实现，会报错提示）"
+   }
+  }
+ },
+ "section_debug": {
+  "type": "section",
+  "name": "调试",
+  "collapsed": true,
+  "fields": {
+   "progress_report": {
+    "type": "switch",
+    "name": "后台任务进度汇报",
+    "default": false,
+    "hint": "关闭（默认）时后台翻译的块级进度只写入日志（logger），不推送到 QQ；开启后才向会话推送进度消息。完成/失败通知不受此开关影响，始终推送"
    }
   }
  }
