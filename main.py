@@ -1,29 +1,31 @@
 """
 KiraAI arXiv 学术助手插件 (kira-ai-plugin-arxiv) v2.0.0
 
-由三个插件合并而来：
+由两个插件合并而来：
 - kira-ai-plugin-arxiv-search（arXiv 查询/下载/摘要翻译）
-- kira-ai-plugin-translate（多后端文本翻译引擎）
-- kira-ai-plugin-pdf-gen（PDF 生成）
+- pdf_translator（论文翻译成中文 PDF：源码优先翻译 + PDF 直接翻译 + 后台任务）
 
 功能：
 - /arxiv search/get/tr/dl/src 斜杠命令（前缀可配置，默认 /arxiv）
 - LLM 工具：arxiv_search / arxiv_get / arxiv_translate / arxiv_download / arxiv_src
-           / parse_arxiv_command / translate / generate_pdf
-- 摘要翻译默认走快速模型，可切换到内置多后端翻译引擎（百度/DeepL/Google/阿里/本地）
+           / parse_arxiv_command / pdf_translate / query_pdf_translate_task
+- 摘要翻译走默认快速模型（ctx.get_default_fast_llm_client，不依赖翻译插件）
+- PDF 翻译两条路线：源码优先（arxiv_id/tex_path → xelatex 编译）与 PDF 直接翻译
+  （提取→分块→翻译→重组 Markdown→xelatex 编译），长 PDF 自动转后台任务
 
 实现要点：
-- arXiv API 礼貌间隔（>=3s）节流 + TTL 缓存 + 原子落盘下载
-- 翻译引擎带配额/限流/缓存/后端自动回退
-- 输出目录统一：data/files/arxiv_pdf、data/files/arxiv_src
+- arXiv API 礼貌间隔（>=3s）节流 + TTL 缓存 + 原子落盘下载 + User-Agent
+- 输出目录统一：data/files/arxiv_pdf、data/files/arxiv_src、data/files/pdf_translator
 """
 
+import asyncio
 import logging
+import os
 import re
+import time
+import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple
-
-import httpx
 
 from core.plugin import BasePlugin, logger, register, on, Priority
 from core.chat.message_utils import MessageChain, KiraMessageEvent
@@ -31,13 +33,25 @@ from core.chat.message_elements import Text, At
 from core.provider import LLMRequest
 
 from .arxiv_core import ArxivClient, ArxivApiError
-from .translate_engine import TranslationEngine
+from .engine import PdfTranslatorEngine
 
 log = logging.getLogger(__name__)
 
+# PDF 翻译默认模型（model_select 未配置时兜底，与 engine.DEFAULT_MODEL 一致）
+DEFAULT_TRANSLATE_MODEL = "deepseek-v4-flash"
+# 默认翻译模型 = 快速模型（R4，model_select 下拉默认值，provider_id:model_id）
+DEFAULT_FAST_MODEL = "3937f0fdf6b7:deepseek-v4-flash-0731"
+
+# ── 后台翻译任务注册表（模块级，跨实例共享）──
+# task_id → 任务状态 dict；asyncio.Lock 保证同一事件循环内对字典的读写串行化
+_TASKS: dict = {}
+_TASKS_LOCK = asyncio.Lock()
+# 持有后台 asyncio.Task 引用，防止任务被垃圾回收而意外取消
+_BG_TASKS: set = set()
+
 
 class ArxivPlugin(BasePlugin):
-    """arXiv 论文查询、翻译与下载，内置多后端翻译与 PDF 生成"""
+    """arXiv 论文查询、翻译与下载，内置论文翻译中文 PDF 引擎"""
 
     SELF_PLUGIN_ID = "kira-ai-plugin-arxiv"
 
@@ -58,27 +72,8 @@ class ArxivPlugin(BasePlugin):
             timeout=timeout,
             sort_by=sort_by,
             max_results=max_results,
+            user_agent=self._cfg("user_agent", ""),
         )
-        engine_cfg = {
-            "default_backend": self._cfg("default_backend", "auto"),
-            "baidu_appid": self._cfg("baidu_appid", ""),
-            "baidu_secret_key": self._cfg("baidu_secret_key", ""),
-            "deepl_api_key": self._cfg("deepl_api_key", ""),
-            "deepl_pro": self._cfg("deepl_pro", False),
-            "google_api_key": self._cfg("google_api_key", ""),
-            "aliyun_access_key_id": self._cfg("aliyun_access_key_id", ""),
-            "aliyun_access_key_secret": self._cfg("aliyun_access_key_secret", ""),
-            "aliyun_region": self._cfg("aliyun_region", "cn-hangzhou"),
-            "local_backend_url": self._cfg("local_backend_url", ""),
-            "local_model": self._cfg("local_model", ""),
-            "local_timeout": self._cfg("local_timeout", 120),
-            "max_chars_per_call": self._cfg("max_chars_per_call", 5000),
-            "max_chars_per_day": self._cfg("max_chars_per_day", 10000),
-            "max_queries_per_min": self._cfg("max_queries_per_min", 30),
-            "enable_cache": self._cfg("enable_cache", True),
-        }
-        self.engine = TranslationEngine(engine_cfg)
-        self._pdf_dir = self._resolve_dir("pdf_dir", "data/files")
 
     def _cfg(self, key: str, default=None):
         """读取配置：优先顶层字段，其次扫描各 section 下的字段。"""
@@ -99,7 +94,7 @@ class ArxivPlugin(BasePlugin):
 
     async def on_load(self):
         logger.info("arXiv 插件已加载，PDF 目录: %s，源码目录: %s", self.download_dir, self.source_dir)
-        for _dir in (self.download_dir, self.source_dir, self._pdf_dir):
+        for _dir in (self.download_dir, self.source_dir):
             try:
                 _dir.mkdir(parents=True, exist_ok=True)
             except OSError as e:
@@ -109,50 +104,49 @@ class ArxivPlugin(BasePlugin):
         logger.info("arXiv 插件已卸载")
 
     async def initialize(self):
-        await self.engine.initialize()
         await self.on_load()
 
     async def terminate(self):
-        await self.engine.close()
+        # 取消仍挂起的后台翻译任务，在途任务标记为 failed
+        for _t in list(_BG_TASKS):
+            if not _t.done():
+                _t.cancel()
+        _BG_TASKS.clear()
+        async with _TASKS_LOCK:
+            for _t in _TASKS.values():
+                if _t.get("status") in ("pending", "running"):
+                    _t["status"] = "failed"
+                    _t["error"] = "任务被取消（插件卸载或系统关闭）"
+                    _t["updated_at"] = time.time()
         await self.on_unload()
 
     # ---------------------------------------------------------------
-    # 摘要翻译（fast=快速模型；其他走内置翻译引擎）
+    # 摘要翻译（默认快速模型，不依赖翻译插件）
     # ---------------------------------------------------------------
+
+    def _get_translation_client(self):
+        """解析翻译模型选择：translation_model（provider:model）→ ctx.get_llm_client；
+        未配置或解析失败回退默认快速模型。"""
+        val = (self._cfg("translation_model", "") or "").strip()
+        if val:
+            try:
+                picked = self.ctx.get_llm_client(model_uuid=val)
+                if picked is not None:
+                    return picked
+            except Exception as e:
+                logger.warning("translation_model 解析失败（%s），回退快速模型: %s", val, e)
+        return self.ctx.get_default_fast_llm_client() or self.ctx.get_default_llm_client()
 
     async def _translate_lines(
         self, lines: List[str], target: str = "zh", client=None, fallback: bool = True
     ) -> Optional[List[str]]:
-        """批量翻译多行文本（每行一条）。
-
-        默认走快速 LLM（原 arxiv-search 行为）；若配置 translate_backend 指定了
-        翻译引擎后端（auto/baidu/.../local），则改走内置 TranslationEngine。
-        """
+        """批量翻译多行文本（每行一条）。默认走快速 LLM；失败/禁用时回退原文。"""
         if not lines:
             return lines
         if not self._cfg("translate_enabled", True):
             return lines if fallback else None
-
-        backend = (self._cfg("translate_backend", "fast") or "fast").strip()
-        if backend != "fast":
-            try:
-                sid = "arxiv-summary"
-                result = await self.engine.translate(
-                    "\n".join(lines), target, "auto", backend, sid=sid
-                )
-            except Exception as e:
-                logger.warning("arXiv 摘要翻译引擎失败: %s", e)
-                return lines if fallback else None
-            if result.startswith("✅"):
-                body = result[1:].split("\n（后端:", 1)[0].strip()
-                translated = [x for x in (body or "").splitlines() if x.strip()]
-                if len(translated) == len(lines):
-                    return translated
-            return lines if fallback else None
-
-        # 默认：快速 LLM
         if client is None:
-            client = self.ctx.get_default_fast_llm_client()
+            client = self._get_translation_client()
         if not client:
             return lines if fallback else None
         try:
@@ -161,7 +155,7 @@ class ArxivPlugin(BasePlugin):
                 f"请将以下 {len(lines)} 条文本逐条翻译成{target}，"
                 f"严格保持编号格式，每条一行，只输出翻译结果，不要任何解释。\n\n{numbered}"
             )
-            request = LLMRequest(messages=[{"role": "user", "content": prompt}])
+            request = LLMRequest(messages=[{"role": "user", "content": prompt}], tools=[])
             response = await client.chat(request)
             result = (response.text_response or "").strip()
             translated: List[str] = []
@@ -179,6 +173,84 @@ class ArxivPlugin(BasePlugin):
     # ---------------------------------------------------------------
     # LLM 工具 1：搜索
     # ---------------------------------------------------------------
+
+    async def _run_tex_task(self, task_id, engine, arxiv_id, tex_path, target_lang, limit, sid):
+        """后台执行源码优先翻译（run_tex）：下载→提取→逐文件翻译→编译，完成后推送结果。"""
+        try:
+            await self._update_task(task_id, status="running")
+            _loop = asyncio.get_running_loop()
+
+            def _on_stage(stage):
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self._update_task(task_id, stage=stage), _loop)
+                except Exception as e:
+                    logger.warning("更新后台任务 %s 阶段 %s 失败: %s", task_id, stage, e)
+
+            def _on_progress(done, total):
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self._update_task(
+                            task_id, done_blocks=int(done), total_blocks=int(total),
+                            stage="translate",
+                        ),
+                        _loop,
+                    )
+                except Exception as e:
+                    logger.warning("更新后台任务 %s 进度失败: %s", task_id, e)
+                step = 1 if total <= 10 else 5
+                if done == total or done % step == 0:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self._send_to_session(sid, f"📖 翻译进度 {done}/{total} 个 tex 文件"),
+                            _loop,
+                        )
+                    except Exception as e:
+                        logger.warning("推送后台任务 %s 进度失败: %s", task_id, e)
+
+            summary = await asyncio.to_thread(
+                engine.run_tex,
+                arxiv_id=arxiv_id or None,
+                tex_path=tex_path or None,
+                limit=limit,
+                lang=target_lang,
+                on_stage=_on_stage,
+                on_progress=_on_progress,
+            )
+            result_pdf = ""
+            for line in str(summary).splitlines():
+                line = line.strip()
+                if line.startswith("- PDF: "):
+                    cand = line.split("- PDF: ", 1)[1].split(" (")[0].strip()
+                    if cand and os.path.exists(cand):
+                        result_pdf = cand
+                    break
+            await self._update_task(
+                task_id, status="done", stage="done", summary=summary,
+                result_md="", result_pdf=result_pdf,
+            )
+            lines = ["✅ 源码优先翻译完成", f"🔖 任务ID：{task_id}"]
+            if result_pdf:
+                lines.append(f"📕 PDF：{result_pdf}")
+            if summary:
+                lines.append(f"📊 统计：{summary}")
+            await self._send_to_session(sid, "\n".join(lines))
+        except asyncio.CancelledError:
+            logger.info("后台源码翻译任务 %s 被取消", task_id)
+            await self._update_task(task_id, status="failed", error="任务被取消（插件卸载或系统关闭）")
+            raise
+        except Exception as e:
+            logger.exception("后台源码翻译任务 %s 失败: %s", task_id, e)
+            err_msg = f"{type(e).__name__}: {e}"
+            await self._update_task(task_id, status="failed", error=err_msg)
+            try:
+                await self._send_to_session(
+                    sid,
+                    f"❌ 源码优先翻译任务 {task_id} 失败：{err_msg}\n"
+                    f"（可用 query_pdf_translate_task(task_id=\"{task_id}\") 查询详情）",
+                )
+            except Exception:
+                logger.exception("发送翻译失败通知失败")
 
     @register.tool(
         "arxiv_search",
@@ -295,7 +367,6 @@ class ArxivPlugin(BasePlugin):
     )
     async def tool_arxiv_download(self, event, arxiv_id: str):
         """下载论文 PDF 到本地。"""
-        import asyncio as _asyncio
         ids = [x.strip() for x in re.split(r"[\s,]+", arxiv_id or "") if x.strip()]
         if not ids:
             return "❌ 请提供 arXiv ID，例如：/arxiv dl 1706.03762"
@@ -306,7 +377,7 @@ class ArxivPlugin(BasePlugin):
                 return f"❌ {e}"
         if len(ids) == 1:
             return await self._download_one(ids[0])
-        results = await _asyncio.gather(
+        results = await asyncio.gather(
             *(self._download_one(pid) for pid in ids),
             return_exceptions=True,
         )
@@ -372,13 +443,9 @@ class ArxivPlugin(BasePlugin):
             return f"❌ 未找到 arXiv 论文：{arxiv_id.strip()}"
         if not self._cfg("translate_enabled", True):
             return "❌ 翻译功能已在配置中关闭（translate_enabled=false），可先用 /arxiv get 查看原文"
-        backend = (self._cfg("translate_backend", "fast") or "fast").strip()
-        if backend == "fast":
-            client = self.ctx.get_default_llm_client()
-            if not client:
-                return "❌ 翻译服务不可用，先试试 /arxiv get"
-        else:
-            client = None
+        client = self.ctx.get_default_llm_client()
+        if not client:
+            return "❌ 翻译服务不可用，先试试 /arxiv get"
         try:
             translated = await self._translate_lines(
                 [paper["title"], paper["summary"]],
@@ -464,89 +531,347 @@ class ArxivPlugin(BasePlugin):
         return await self._parse_and_execute(command or "", event)
 
     # ---------------------------------------------------------------
-    # LLM 工具 7：多后端翻译（合并自 kira-ai-plugin-translate）
+    # PDF 翻译（合并自 pdf_translator：源码优先 + PDF 直接翻译 + 后台任务）
     # ---------------------------------------------------------------
 
+    def _engine(self) -> PdfTranslatorEngine:
+        """根据插件配置（schema section_pdf_translate）构造引擎实例。
+        翻译模型支持 model_select（translation_model 存 provider_id:model_id），
+        空则回退旧字段 model（兼容），再回退默认快速模型。"""
+        s = self.plugin_cfg.get("section_pdf_translate", {}) or {}
+        translation_model = (s.get("translation_model") or "").strip()
+        model = (s.get("model") or "").strip() or DEFAULT_TRANSLATE_MODEL
+        provider = "deepseek-main"
+        if translation_model:
+            if ":" in translation_model:
+                provider, model = translation_model.split(":", 1)
+            else:
+                model = translation_model
+        return PdfTranslatorEngine(
+            root=None,  # engine 自动向上定位 KiraAI 根目录
+            model=model or DEFAULT_TRANSLATE_MODEL,
+            provider=provider or "deepseek-main",
+            base_url=(s.get("base_url") or "").strip() or None,
+            api_key=(s.get("api_key") or "").strip() or None,
+            chunk_size=int(s.get("chunk_size") or 1800),
+            output_dir=(s.get("output_dir") or "").strip() or None,
+            enable_mineru=bool(s.get("enable_mineru", False)),
+        )
+
+    @staticmethod
+    def _new_task_id() -> str:
+        """生成后台翻译任务 ID：PDFTR + 时间戳 + uuid 短码（如 PDFTR1700000000A1B2C3）。"""
+        return f"PDFTR{int(time.time())}{uuid.uuid4().hex[:6].upper()}"
+
+    async def _update_task(self, task_id: str, **fields):
+        async with _TASKS_LOCK:
+            task = _TASKS.get(task_id)
+            if task is None:
+                return
+            task.update(fields)
+            task["updated_at"] = time.time()
+
+    def _schedule_background(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+        return task
+
+    async def _send_to_session(self, sid: str, content: str):
+        if not sid:
+            return
+        try:
+            await self.ctx.message_processor.send_message_chain(
+                session=sid, chain=MessageChain([Text(content)])
+            )
+        except Exception as e:
+            logger.warning("向会话 %s 发送消息失败: %s", sid, e)
+
+    def _format_task(self, task_id: str) -> str:
+        task = _TASKS.get(task_id)
+        if task is None:
+            return f"❌ 未找到翻译任务：{task_id}"
+        status = task.get("status", "unknown")
+        icon = {
+            "pending": "⏳ 排队中",
+            "running": "🔄 进行中",
+            "done": "✅ 已完成",
+            "failed": "❌ 已失败",
+        }.get(status, f"❓ {status}")
+        stage_name = {
+            "queued": "排队",
+            "download": "下载源码",
+            "extract": "提取文本",
+            "chunk": "清洗分块",
+            "translate": "分块翻译",
+            "compile": "编译 PDF",
+            "done": "完成",
+        }.get(task.get("stage", ""), task.get("stage", "") or "-")
+        lines = [
+            f"{icon} PDF 翻译任务 {task_id}",
+            f"📄 PDF：{task.get('pdf_path', '-')}",
+            f"🛠 当前阶段：{stage_name}",
+        ]
+        total = task.get("total_blocks", 0)
+        done = task.get("done_blocks", 0)
+        if total:
+            lines.append(f"📖 翻译进度：{done}/{total} 块")
+        elif status in ("running", "pending"):
+            lines.append("📖 翻译进度：尚未开始分块")
+        if task.get("result_md"):
+            lines.append(f"📝 Markdown：{task['result_md']}")
+        if task.get("result_pdf"):
+            lines.append(f"📕 PDF：{task['result_pdf']}")
+        if task.get("summary"):
+            lines.append(f"📊 统计：{task['summary']}")
+        if status == "failed" and task.get("error"):
+            lines.append(f"🚨 错误：{task['error']}")
+        elapsed = time.time() - task.get("created_at", time.time())
+        lines.append(f"⏱ 耗时：{elapsed:.0f}s")
+        return "\n".join(lines)
+
+    async def _run_translate_task(self, task_id, engine, pdf_path, target_lang, limit, sid):
+        """后台执行 PDF 翻译：全程更新任务状态并推送进度，完成后推送结果路径。"""
+        try:
+            await self._update_task(task_id, status="running")
+            _loop = asyncio.get_running_loop()
+
+            def _on_stage(stage):
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self._update_task(task_id, stage=stage), _loop)
+                except Exception as e:
+                    logger.warning("更新后台任务 %s 阶段 %s 失败: %s", task_id, stage, e)
+
+            def _on_progress(done, total):
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self._update_task(
+                            task_id, done_blocks=int(done), total_blocks=int(total),
+                            stage="translate",
+                        ),
+                        _loop,
+                    )
+                except Exception as e:
+                    logger.warning("更新后台任务 %s 进度失败: %s", task_id, e)
+                step = 1 if total <= 10 else 5
+                if done == total or done % step == 0:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self._send_to_session(sid, f"📖 翻译进度 {done}/{total} 块"),
+                            _loop,
+                        )
+                    except Exception as e:
+                        logger.warning("推送后台任务 %s 进度失败: %s", task_id, e)
+
+            summary = await asyncio.to_thread(
+                engine.run, pdf_path, limit, target_lang,
+                on_stage=_on_stage, on_progress=_on_progress, chunks=None,
+            )
+
+            stem = os.path.splitext(os.path.basename(pdf_path))[0] or "document"
+            output_dir = getattr(engine, "output_dir", "") or ""
+            result_md = os.path.join(output_dir, f"{stem}_zh.md")
+            result_pdf = os.path.join(output_dir, f"{stem}_zh.pdf")
+            result_md = result_md if os.path.exists(result_md) else ""
+            result_pdf = result_pdf if os.path.exists(result_pdf) else ""
+
+            await self._update_task(
+                task_id, status="done", stage="done", summary=summary,
+                result_md=result_md, result_pdf=result_pdf,
+            )
+            lines = ["✅ PDF 翻译完成", f"🔖 任务ID：{task_id}"]
+            if result_md:
+                lines.append(f"📝 Markdown：{result_md}")
+            if result_pdf:
+                lines.append(f"📕 PDF：{result_pdf}")
+            if summary:
+                lines.append(f"📊 统计：{summary}")
+            await self._send_to_session(sid, "\n".join(lines))
+        except asyncio.CancelledError:
+            logger.info("后台翻译任务 %s 被取消", task_id)
+            await self._update_task(task_id, status="failed", error="任务被取消（插件卸载或系统关闭）")
+            raise
+        except Exception as e:
+            logger.exception("后台翻译任务 %s 失败: %s", task_id, e)
+            err_msg = f"{type(e).__name__}: {e}"
+            await self._update_task(task_id, status="failed", error=err_msg)
+            try:
+                await self._send_to_session(
+                    sid,
+                    f"❌ PDF 翻译任务 {task_id} 失败：{err_msg}\n"
+                    f"（可用 query_pdf_translate_task(task_id=\"{task_id}\") 查询详情）",
+                )
+            except Exception:
+                logger.exception("发送翻译失败通知失败")
+
     @register.tool(
-        name="translate",
+        name="pdf_translate",
         description=(
-            "将文本翻译成目标语言。自动检测源语言；支持多后端（百度/DeepL/Google/阿里云/本地模型），"
-            "默认按配置自动回退。适用于对话翻译、长文翻译、术语查译。"
+            "把学术论文翻译成中文 PDF，支持两条路线："
+            "① 源码优先翻译（推荐）：传 arxiv_id（arXiv 编号，如 2401.00001）或 tex_path"
+            "（本地 TeX 源码/源码包 .tex/.tex.gz/.tar.gz/.tgz），引擎下载/读取源码→xelatex 编译中文 PDF；"
+            "② PDF 翻译：传 pdf_path 走 PDF→分块→翻译→xelatex 编译。"
+            "长 PDF（块数超过后台阈值 background_threshold，默认 20）自动转后台任务：立即返回任务 ID，"
+            "执行期间推送进度，完成后自动发送结果，可用 query_pdf_translate_task 查询。"
+            "两条路线输出均到 data/files/pdf_translator/。"
         ),
         params={
             "type": "object",
             "properties": {
-                "text": {"type": "string", "description": "需要翻译的文本"},
-                "target_lang": {
-                    "type": "string",
-                    "description": "目标语言代码：zh(中文) en(英语) ja(日语) ko(韩语) fr(法语) "
-                                   "de(德语) es(西语) ru(俄语) pt(葡语) it(意语) nl(荷语) "
-                                   "ar(阿语) hi(印地语) th(泰语) vi(越语) id(印尼语)",
-                },
-                "source_lang": {"type": "string", "description": "源语言代码，auto=自动检测（默认 auto）"},
-                "backend": {"type": "string", "description": "指定后端：auto(默认，按配置回退)/baidu/deepl/google/aliyun/local"},
+                "pdf_path": {"type": "string", "description": "待翻译 PDF 的本地路径（PDF 翻译路线；走源码优先翻译时可不传）。超过后台阈值时自动转为后台任务并返回任务 ID"},
+                "arxiv_id": {"type": "string", "description": "arXiv 编号（如 2401.00001），提供则走源码优先翻译"},
+                "tex_path": {"type": "string", "description": "本地 TeX 源码/源码包（.tex/.tex.gz/.tar.gz/.tgz）路径，提供则走源码优先翻译"},
+                "target_lang": {"type": "string", "description": "目标语言，默认 zh（可选）"},
+                "limit": {"type": "integer", "description": "只翻译前 N 块（测试用，可选）"}
             },
-            "required": ["text", "target_lang"],
-        },
+            "required": []
+        }
     )
-    async def tool_translate(
-        self,
-        event,
-        *_,
-        text: str,
-        target_lang: str,
-        source_lang: str = "auto",
-        backend: str = "auto",
-    ) -> str:
-        """翻译文本（含额度/限流/缓存/后端回退）"""
+    async def pdf_translate(self, event, pdf_path: str = "", arxiv_id: str = "",
+                            tex_path: str = "", target_lang: str = "zh", limit: int = 0) -> str:
         if not self._cfg("enable_tool", True):
-            return "❌ translate 工具已关闭（可在插件配置页开启）。"
-        sid = getattr(event, "sid", None) or (
-            event.session.session_id if event and event.session else "unknown"
-        )
-        return await self.engine.translate(text, target_lang, source_lang, backend, sid=sid)
-
-    # ---------------------------------------------------------------
-    # LLM 工具 8：PDF 生成（合并自 kira-ai-plugin-pdf-gen）
-    # ---------------------------------------------------------------
+            return "❌ pdf_translate 工具已关闭（可在插件配置页开启）。"
+        pdf_path = (pdf_path or "").strip()
+        arxiv_id = (arxiv_id or "").strip()
+        tex_path = (tex_path or "").strip()
+        if not arxiv_id and not tex_path and not pdf_path:
+            return ("pdf_translate 参数错误：请至少提供 pdf_path（PDF 翻译路线）"
+                    "或 arxiv_id / tex_path（源码优先翻译路线）")
+        engine = self._engine()
+        try:
+            if arxiv_id or tex_path:
+                sid = self._get_sid(event)
+                if not sid:
+                    summary = await asyncio.to_thread(
+                        engine.run_tex,
+                        arxiv_id=arxiv_id or None,
+                        tex_path=tex_path or None,
+                        limit=int(limit or 0),
+                        lang=target_lang,
+                    )
+                    return summary
+                task_id = self._new_task_id()
+                record = {
+                    "task_id": task_id,
+                    "pdf_path": tex_path or f"arxiv:{arxiv_id}",
+                    "sid": sid,
+                    "target_lang": target_lang,
+                    "limit": int(limit or 0),
+                    "status": "pending",
+                    "stage": "queued",
+                    "total_blocks": 0,
+                    "done_blocks": 0,
+                    "result_md": "",
+                    "result_pdf": "",
+                    "summary": "",
+                    "error": "",
+                    "created_at": time.time(),
+                    "updated_at": time.time(),
+                }
+                async with _TASKS_LOCK:
+                    _TASKS[task_id] = record
+                self._schedule_background(
+                    self._run_tex_task(
+                        task_id, engine, arxiv_id or None, tex_path or None,
+                        target_lang, int(limit or 0), sid,
+                    )
+                )
+                logger.info("源码优先翻译任务已提交后台: %s (tex=%s, sid=%s)",
+                            task_id, tex_path or arxiv_id, sid)
+                return (
+                    f"📖 源码优先翻译任务已提交，任务ID：{task_id}\n"
+                    f"📨 执行期间推送进度，完成后自动发送结果\n"
+                    f"🔎 查询进度：query_pdf_translate_task(task_id=\"{task_id}\")"
+                )
+            else:
+                chunks = await asyncio.to_thread(engine.prepare, pdf_path)
+                try:
+                    threshold = int(
+                        (self.plugin_cfg.get("section_pdf_translate", {}) or {})
+                        .get("background_threshold", 20) or 20
+                    )
+                except (TypeError, ValueError):
+                    threshold = 20
+                if len(chunks) > threshold:
+                    sid = self._get_sid(event)
+                    if not sid:
+                        summary = await asyncio.to_thread(
+                            engine.run, pdf_path, int(limit or 0), target_lang, chunks=chunks)
+                        return summary
+                    async with _TASKS_LOCK:
+                        for _tid, _t in _TASKS.items():
+                            if (_t.get("sid") == sid
+                                    and _t.get("pdf_path") == pdf_path
+                                    and _t.get("status") in ("pending", "running")):
+                                return (
+                                    f"⚠️ 该会话已有同一 PDF 的翻译任务进行中（任务ID：{_tid}）。\n"
+                                    f"可用 query_pdf_translate_task(task_id=\"{_tid}\") 查询进度。"
+                                )
+                    task_id = self._new_task_id()
+                    record = {
+                        "task_id": task_id,
+                        "pdf_path": pdf_path,
+                        "sid": sid,
+                        "target_lang": target_lang,
+                        "limit": int(limit or 0),
+                        "status": "pending",
+                        "stage": "queued",
+                        "total_blocks": len(chunks),
+                        "done_blocks": 0,
+                        "result_md": "",
+                        "result_pdf": "",
+                        "summary": "",
+                        "error": "",
+                        "created_at": time.time(),
+                        "updated_at": time.time(),
+                    }
+                    async with _TASKS_LOCK:
+                        _TASKS[task_id] = record
+                    self._schedule_background(
+                        self._run_translate_task(
+                            task_id, engine, pdf_path, target_lang, int(limit or 0), sid))
+                    n = len(chunks)
+                    logger.info("PDF 翻译任务已提交后台: %s (pdf=%s, blocks=%d, sid=%s)",
+                                task_id, pdf_path, n, sid)
+                    return (
+                        f"📖 翻译任务已提交，任务ID：{task_id}\n"
+                        f"共 {n} 块，超过阈值 {threshold}，已转入后台执行（不阻塞）\n"
+                        f"📨 执行期间推送进度，完成后自动发送结果\n"
+                        f"🔎 查询进度：query_pdf_translate_task(task_id=\"{task_id}\")"
+                    )
+                summary = await asyncio.to_thread(
+                    engine.run, pdf_path, int(limit or 0), target_lang, chunks=chunks)
+            return summary
+        except Exception as e:
+            logger.error("pdf_translate 失败: %s", e)
+            return f"PDF 翻译失败：{e}"
 
     @register.tool(
-        name="generate_pdf",
-        description="将文本内容生成PDF文件，支持标题、正文、题目选项和答案等排版。返回 PDF 文件名与路径。",
+        name="query_pdf_translate_task",
+        description=(
+            "查询 pdf_translate 提交的长 PDF 后台翻译任务的状态。返回任务状态"
+            "（pending 排队中 / running 进行中 / done 已完成 / failed 已失败）、当前阶段"
+            "（提取文本/清洗分块/分块翻译/编译 PDF）、分块翻译进度（已翻译块数/总块数）、"
+            "结果 Markdown/PDF 路径或错误信息。task_id 由 pdf_translate 提交长任务时返回的任务 ID。"
+        ),
         params={
             "type": "object",
             "properties": {
-                "title": {"type": "string", "description": "PDF标题"},
-                "body": {"type": "string", "description": "正文内容"},
+                "task_id": {
+                    "type": "string",
+                    "description": "由 pdf_translate 提交长任务时返回的任务 ID，可查状态/阶段/进度/结果"
+                }
             },
-            "required": ["title", "body"],
-        },
+            "required": ["task_id"]
+        }
     )
-    async def tool_generate_pdf(self, event, title: str, body: str) -> str:
-        """生成 PDF 文件（基于 fpdf，正文自动换行分页）。"""
-        if not self._cfg("enable_pdf_tool", True):
-            return "❌ generate_pdf 工具已关闭（可在插件配置页开启）。"
-        try:
-            from fpdf import FPDF
-        except ImportError:
-            return "❌ PDF 生成失败：缺少 fpdf 库，请先 pip install fpdf"
-        try:
-            self._pdf_dir.mkdir(parents=True, exist_ok=True)
-            pdf = FPDF()
-            pdf.add_page()
-            pdf.set_auto_page_break(auto=True, margin=20)
-            pdf.set_font("Helvetica", "B", 16)
-            pdf.cell(0, 10, title, new_x="LMARGIN", new_y="NEXT", align="C")
-            pdf.ln(5)
-            pdf.set_font("Helvetica", "", 11)
-            pdf.multi_cell(0, 5.5, body or "")
-            filename = f"pdf_{abs(hash(title)) % 10000}.pdf"
-            filepath = self._pdf_dir / filename
-            pdf.output(str(filepath))
-            return f"✅ PDF 已生成：{filename}（{filepath}）"
-        except Exception as e:
-            logger.error("PDF 生成失败: %s", e)
-            return f"❌ PDF 生成失败：{e}"
+    async def query_pdf_translate_task(self, event, task_id: str) -> str:
+        """查询 PDF 翻译后台任务状态。"""
+        task_id = (task_id or "").strip()
+        if not task_id:
+            return "❌ 请提供任务 ID，例如：query_pdf_translate_task(task_id=\"PDFTR...\")"
+        return self._format_task(task_id)
 
     # ---------------------------------------------------------------
     # 斜杠命令支持（/arxiv ...）
