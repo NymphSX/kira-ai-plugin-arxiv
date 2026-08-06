@@ -1,35 +1,168 @@
 {
-    "max_results": {"type": "integer", "name": "默认搜索条数", "default": 5, "minimum": 1, "maximum": 20, "hint": "/arxiv search 默认返回的论文条数"},
-    "translation_model": {
-        "type": "model_select",
-        "model_type": "llm",
-        "name": "翻译模型",
-        "default": "",
-        "hint": "论文翻译（标题/摘要/LaTeX/PDF）使用的模型，格式 provider:model；留空=默认快速模型"
-    },
-    "request_timeout": {"type": "integer", "name": "请求超时（秒）", "default": 15, "hint": "arXiv API 请求超时秒数；PDF 下载使用该值的 2 倍"},
-    "user_agent": {"type": "string", "name": "User-Agent", "default": "", "hint": "arXiv API 请求携带的 User-Agent；留空用内置默认（arXiv 官方要求带 UA，无 UA 易被限流）"},
-    "sort_by": {"type": "enum", "name": "默认排序", "options": ["relevance", "submittedDate", "lastUpdatedDate"], "default": "relevance", "hint": "搜索结果排序：相关度 / 提交日期 / 最近更新"},
-    "download_dir": {"type": "string", "name": "PDF 下载目录", "default": "data/files/arxiv_pdf", "hint": "PDF 保存目录（相对项目根目录，或绝对路径）"},
-    "source_dir": {"type": "string", "name": "源码下载目录", "default": "data/files/arxiv_src", "hint": "LaTeX 源码包保存目录（相对项目根目录，或绝对路径）"},
-    "command": {"type": "section", "name": "命令设置", "hint": "斜杠命令前缀、开关与白名单", "collapsed": true, "fields": {
-        "command_prefix": {"type": "string", "name": "命令前缀", "default": "/arxiv", "hint": "斜杠命令前缀，必须以 / 开头，如 /arxiv"},
-        "enable_commands": {"type": "switch", "name": "启用斜杠命令", "default": true, "hint": "关闭后 /arxiv 命令不生效（LLM 工具仍可用）"},
-        "slash_whitelist": {"type": "list", "name": "斜杠命令白名单", "default": [], "hint": "允许使用斜杠命令的 QQ 号（每行一个）；留空=不限制所有用户可用；使用斜杠命令需先 @机器人（私聊无需）"}
-    }},
-    "translate": {"type": "section", "name": "翻译设置", "hint": "标题/摘要翻译相关配置（走默认快速模型）", "collapsed": true, "fields": {
-        "translate_enabled": {"type": "switch", "name": "启用摘要翻译", "default": true, "hint": "关闭后 -t/--translate 参数与 arxiv_translate 工具不生效"},
-        "translate_lang": {"type": "enum", "name": "目标语言", "options": ["zh", "en", "ja", "ko"], "default": "zh", "hint": "摘要翻译目标语言"}
-    }},
-    "section_pdf_translate": {"type": "section", "name": "PDF 翻译", "collapsed": false, "fields": {
-        "enable_tool": {"type": "switch", "name": "启用 pdf_translate 工具", "default": true, "hint": "关闭后 LLM 无法调用 pdf_translate 工具"},
-        "translation_model": {"type": "model_select", "model_type": "llm", "name": "翻译模型", "default": "3937f0fdf6b7:deepseek-v4-flash-0731", "hint": "翻译使用的模型（provider:model），默认快速模型；留空则用默认 LLM"},
-        "model": {"type": "string", "name": "翻译模型（旧字段，兼容）", "default": "deepseek-v4-flash", "hint": "兼容旧配置：translation_model 为空时回退该字段"},
-        "base_url": {"type": "string", "name": "API Base URL（覆盖全局）", "default": "", "hint": "留空则读取全局 system_config.json 的对应 provider 配置"},
-        "api_key": {"type": "string", "name": "API Key（覆盖全局）", "default": "", "hint": "留空则读取全局 system_config.json 的对应 provider 配置"},
-        "chunk_size": {"type": "integer", "name": "翻译块大小", "default": 1800, "minimum": 200, "hint": "合并后每块目标字符数（分块上限固定 1200）"},
-        "background_threshold": {"type": "integer", "name": "后台任务阈值（块数）", "default": 20, "minimum": 1, "hint": "翻译块数超过该值时自动提交为后台任务，立即返回任务 ID，进度可查（query_pdf_translate_task）"},
-        "output_dir": {"type": "string", "name": "输出目录", "default": "data/files/pdf_translator", "hint": "中文 Markdown 与 PDF 的输出目录（相对 KiraAI 根目录或绝对路径）"},
-        "enable_mineru": {"type": "switch", "name": "启用 Mineru 提取后端", "default": false, "hint": "false 时用 PyMuPDF 提取文本；true 时调用 Mineru（尚未实现，会报错提示）"}
-    }}
+ "max_results": {
+  "type": "integer",
+  "name": "默认搜索条数",
+  "default": 5,
+  "minimum": 1,
+  "maximum": 20,
+  "hint": "/arxiv search 默认返回的论文条数"
+ },
+ "translation_model": {
+  "type": "model_select",
+  "model_type": "llm",
+  "name": "翻译模型",
+  "default": "",
+  "hint": "论文翻译（标题/摘要/LaTeX/PDF）使用的模型，格式 provider:model；留空=默认快速模型"
+ },
+ "request_timeout": {
+  "type": "integer",
+  "name": "请求超时（秒）",
+  "default": 15,
+  "hint": "arXiv API 请求超时秒数；PDF 下载使用该值的 2 倍"
+ },
+ "user_agent": {
+  "type": "string",
+  "name": "User-Agent",
+  "default": "",
+  "hint": "arXiv API 请求携带的 User-Agent；留空用内置默认（arXiv 官方要求带 UA，无 UA 易被限流）"
+ },
+ "sort_by": {
+  "type": "enum",
+  "name": "默认排序",
+  "options": [
+   "relevance",
+   "submittedDate",
+   "lastUpdatedDate"
+  ],
+  "default": "relevance",
+  "hint": "搜索结果排序：相关度 / 提交日期 / 最近更新"
+ },
+ "download_dir": {
+  "type": "string",
+  "name": "PDF 下载目录",
+  "default": "data/files/arxiv_pdf",
+  "hint": "PDF 保存目录（相对项目根目录，或绝对路径）"
+ },
+ "source_dir": {
+  "type": "string",
+  "name": "源码下载目录",
+  "default": "data/files/arxiv_src",
+  "hint": "LaTeX 源码包保存目录（相对项目根目录，或绝对路径）"
+ },
+ "command": {
+  "type": "section",
+  "name": "命令设置",
+  "hint": "斜杠命令前缀、开关与白名单",
+  "collapsed": true,
+  "fields": {
+   "command_prefix": {
+    "type": "string",
+    "name": "命令前缀",
+    "default": "/arxiv",
+    "hint": "斜杠命令前缀，必须以 / 开头，如 /arxiv"
+   },
+   "enable_commands": {
+    "type": "switch",
+    "name": "启用斜杠命令",
+    "default": false,
+    "hint": "关闭后 /arxiv 命令不生效（LLM 工具仍可用）；默认关闭，需在配置中手动开启"
+   },
+   "slash_whitelist": {
+    "type": "list",
+    "name": "斜杠命令白名单",
+    "default": [],
+    "hint": "允许使用斜杠命令的 QQ 号（每行一个）；留空=不限制所有用户可用；使用斜杠命令需先 @机器人（私聊无需）"
+   }
+  }
+ },
+ "translate": {
+  "type": "section",
+  "name": "翻译设置",
+  "hint": "标题/摘要翻译相关配置（走默认快速模型）",
+  "collapsed": true,
+  "fields": {
+   "translate_enabled": {
+    "type": "switch",
+    "name": "启用摘要翻译",
+    "default": true,
+    "hint": "关闭后 -t/--translate 参数与 arxiv_translate 工具不生效"
+   },
+   "translate_lang": {
+    "type": "enum",
+    "name": "目标语言",
+    "options": [
+     "zh",
+     "en",
+     "ja",
+     "ko"
+    ],
+    "default": "zh",
+    "hint": "摘要翻译目标语言"
+   }
+  }
+ },
+ "section_pdf_translate": {
+  "type": "section",
+  "name": "PDF 翻译",
+  "collapsed": false,
+  "fields": {
+   "enable_tool": {
+    "type": "switch",
+    "name": "启用 pdf_translate 工具",
+    "default": true,
+    "hint": "关闭后 LLM 无法调用 pdf_translate 工具"
+   },
+   "translation_model": {
+    "type": "model_select",
+    "model_type": "llm",
+    "name": "翻译模型",
+    "default": "3937f0fdf6b7:deepseek-v4-flash-0731",
+    "hint": "翻译使用的模型（provider:model），默认快速模型；留空则用默认 LLM"
+   },
+   "model": {
+    "type": "string",
+    "name": "翻译模型（旧字段，兼容）",
+    "default": "deepseek-v4-flash",
+    "hint": "兼容旧配置：translation_model 为空时回退该字段"
+   },
+   "base_url": {
+    "type": "string",
+    "name": "API Base URL（覆盖全局）",
+    "default": "",
+    "hint": "留空则读取全局 system_config.json 的对应 provider 配置"
+   },
+   "api_key": {
+    "type": "string",
+    "name": "API Key（覆盖全局）",
+    "default": "",
+    "hint": "留空则读取全局 system_config.json 的对应 provider 配置"
+   },
+   "chunk_size": {
+    "type": "integer",
+    "name": "翻译块大小",
+    "default": 1800,
+    "minimum": 200,
+    "hint": "合并后每块目标字符数（分块上限固定 1200）"
+   },
+   "background_threshold": {
+    "type": "integer",
+    "name": "后台任务阈值（块数）",
+    "default": 20,
+    "minimum": 1,
+    "hint": "翻译块数超过该值时自动提交为后台任务，立即返回任务 ID，进度可查（query_pdf_translate_task）"
+   },
+   "output_dir": {
+    "type": "string",
+    "name": "输出目录",
+    "default": "data/files/pdf_translator",
+    "hint": "中文 Markdown 与 PDF 的输出目录（相对 KiraAI 根目录或绝对路径）"
+   },
+   "enable_mineru": {
+    "type": "switch",
+    "name": "启用 Mineru 提取后端",
+    "default": false,
+    "hint": "false 时用 PyMuPDF 提取文本；true 时调用 Mineru（尚未实现，会报错提示）"
+   }
+  }
+ }
 }
