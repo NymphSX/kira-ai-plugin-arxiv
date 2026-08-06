@@ -583,6 +583,40 @@ class ArxivPlugin(BasePlugin):
         """生成后台翻译任务 ID：PDFTR + 时间戳 + uuid 短码（如 PDFTR1700000000A1B2C3）。"""
         return f"PDFTR{int(time.time())}{uuid.uuid4().hex[:6].upper()}"
 
+    @staticmethod
+    def _prune_tasks(max_kept: int = 50, ttl: float = 3600.0) -> int:
+        """清理已完成/失败的后台任务记录，防内存泄漏。
+        - 活跃任务（pending/running）永不清理
+        - 完成/失败超过 ttl 秒（默认 1 小时）或超过 max_kept 条时移除
+        返回清理条数。"""
+        now = time.time()
+        done_keys = [
+            tid for tid, t in _TASKS.items()
+            if t.get("status") in ("done", "failed")
+        ]
+        removed = 0
+        # 1) 超期清理
+        for tid in done_keys:
+            t = _TASKS.get(tid)
+            if t is None:
+                continue
+            if now - t.get("updated_at", t.get("created_at", now)) > ttl:
+                _TASKS.pop(tid, None)
+                removed += 1
+        # 2) 超量清理（保留最近的）
+        done_keys = [
+            tid for tid, t in _TASKS.items()
+            if t.get("status") in ("done", "failed")
+        ]
+        if len(done_keys) > max_kept:
+            done_keys.sort(
+                key=lambda tid: _TASKS[tid].get("updated_at", _TASKS[tid].get("created_at", 0)),
+            )
+            for tid in done_keys[: len(done_keys) - max_kept]:
+                _TASKS.pop(tid, None)
+                removed += 1
+        return removed
+
     async def _update_task(self, task_id: str, **fields):
         async with _TASKS_LOCK:
             task = _TASKS.get(task_id)
@@ -827,6 +861,7 @@ class ArxivPlugin(BasePlugin):
                 }
                 async with _TASKS_LOCK:
                     _TASKS[task_id] = record
+                self._prune_tasks()  # 顺手清理已完成/失败任务，防内存泄漏
                 self._schedule_background(
                     self._run_tex_task(
                         task_id, engine, arxiv_id or None, tex_path or None,
@@ -884,6 +919,7 @@ class ArxivPlugin(BasePlugin):
                     }
                     async with _TASKS_LOCK:
                         _TASKS[task_id] = record
+                    self._prune_tasks()  # 顺手清理已完成/失败任务，防内存泄漏
                     self._schedule_background(
                         self._run_translate_task(
                             task_id, engine, pdf_path, target_lang, int(limit or 0), sid))

@@ -139,20 +139,45 @@ class ArxivClient:
     async def _api_query(self, params: dict) -> List[dict]:
         global _last_api_call
         timeout = self.timeout
+        # 限流/服务端错误重试：429/5xx → 指数退避，最多 3 次
+        max_retries = 3
+        last_exc: Optional[Exception] = None
         async with _api_lock:
             now = time.monotonic()
             wait = MIN_API_INTERVAL - (now - _last_api_call)
             if wait > 0:
                 await asyncio.sleep(wait)
-            try:
-                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
-                                             headers={"User-Agent": self.user_agent}) as client:
-                    resp = await client.get(API_BASE, params=params)
+            for attempt in range(max_retries):
+                try:
+                    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
+                                                 headers={"User-Agent": self.user_agent}) as client:
+                        resp = await client.get(API_BASE, params=params)
+                    if resp.status_code in (429,) or resp.status_code >= 500:
+                        retry_after = 0.0
+                        ra = resp.headers.get("Retry-After")
+                        if ra:
+                            try:
+                                retry_after = float(ra)
+                            except ValueError:
+                                retry_after = 0.0
+                        backoff = max(retry_after, 2 ** (attempt + 1))  # 2s/4s/8s 指数退避
+                        print(f"[arxiv] HTTP {resp.status_code}，{backoff:.0f}s 后重试 "
+                              f"({attempt + 1}/{max_retries})", flush=True)
+                        await asyncio.sleep(backoff)
+                        continue
                     resp.raise_for_status()
                     content = resp.content
-                _last_api_call = time.monotonic()
-            except httpx.HTTPError as e:
-                raise ArxivApiError(f"arXiv API 请求失败: {e}") from e
+                    _last_api_call = time.monotonic()
+                    break
+                except httpx.HTTPError as e:
+                    last_exc = e
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+            else:
+                raise ArxivApiError(
+                    f"arXiv API 请求失败（重试 {max_retries} 次后仍失败）: {last_exc}"
+                ) from last_exc
         try:
             root = ET.fromstring(content)
         except ET.ParseError as e:

@@ -641,7 +641,37 @@ class PdfTranslatorEngine:
         print(f"[FAIL] {last_err}", flush=True)
         return None
 
-    def _translate_tex_content(self, tex_text, base, key, model, limit=0, on_block=None):
+    # ---- 断点续翻缓存（源码优先翻译路线） ----
+    @staticmethod
+    def _load_tex_cache(cache_path):
+        """加载源码翻译断点缓存（块 md5 -> 译文行列表）。文件缺失/损坏返回空 dict。"""
+        if not cache_path or not os.path.exists(cache_path):
+            return {}
+        try:
+            with open(cache_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _save_tex_cache(cache_path, cache):
+        """原子落盘断点缓存（临时文件 + os.replace），避免进程崩溃损坏缓存。"""
+        if not cache_path:
+            return
+        try:
+            d = os.path.dirname(cache_path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            tmp = cache_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(cache, fh, ensure_ascii=False)
+            os.replace(tmp, cache_path)
+        except Exception as e:
+            print(f"[cache] 断点缓存写入失败: {e}", flush=True)
+
+    def _translate_tex_content(self, tex_text, base, key, model, limit=0, on_block=None,
+                               cache=None, cache_path=None):
         """翻译 .tex 正文：保护 LaTeX 结构，\\caption 内容强制翻译。返回 (译文或 None, 说明)。"""
         out_lines = []
         pending = []    # (out_idx, protected_text, ph)
@@ -692,15 +722,25 @@ class PdfTranslatorEngine:
                 blocks.append(cur)
             for bi, blk in enumerate(blocks, 1):
                 block_text = "\n".join(t for _, t in blk)
-                tr = self._chat_retry(base, key, model, block_text)
-                bt = None
-                if tr is not None:
-                    bt = tr.split("\n")
-                if tr is None or len(bt) != len(blk):
-                    # 修复3：块级失败/行数不符 → 整块写回原文（保护后原行），不再逐行重译
-                    print(f"[translate] 块级行数不符({-1 if bt is None else len(bt)} vs {len(blk)})，整块写回原文",
-                          flush=True)
-                    bt = [t for _, t in blk]
+                # 断点续翻：块 md5 命中缓存则直接复用，不再调 LLM
+                block_key = hashlib.md5(block_text.encode("utf-8")).hexdigest()
+                cached = (cache or {}).get(block_key)
+                if cached is not None:
+                    bt = cached
+                    print(f"[cache] 命中正文块 {bi}/{len(blocks)}（{len(bt)} 行），跳过", flush=True)
+                else:
+                    tr = self._chat_retry(base, key, model, block_text)
+                    bt = None
+                    if tr is not None:
+                        bt = tr.split("\n")
+                    if tr is None or len(bt) != len(blk):
+                        # 修复3：块级失败/行数不符 → 整块写回原文（保护后原行），不再逐行重译
+                        print(f"[translate] 块级行数不符({-1 if bt is None else len(bt)} vs {len(blk)})，整块写回原文",
+                              flush=True)
+                        bt = [t for _, t in blk]
+                    elif cache is not None:
+                        cache[block_key] = bt
+                        self._save_tex_cache(cache_path, cache)
                 for (idx, _t), tline in zip(blk, bt):
                     rows[idx] = tline
                 if on_block:                     # 修复B：正文块级进度回调（每块一次）
@@ -728,14 +768,24 @@ class PdfTranslatorEngine:
                 blocks.append(cur)
             for bi, blk in enumerate(blocks, 1):
                 block_text = "\n".join(c for _, _, c in blk)
-                tr = self._chat_retry(base, key, model, block_text)
-                ct = None
-                if tr is not None:
-                    ct = tr.split("\n")
-                if tr is None or len(ct) != len(blk):
-                    print(f"[translate] caption 块行数不符({-1 if ct is None else len(ct)} vs {len(blk)})，回退原文内容",
-                          flush=True)
-                    ct = [c for _, _, c in blk]
+                # 断点续翻：caption 块 md5 命中缓存则直接复用
+                block_key = hashlib.md5(block_text.encode("utf-8")).hexdigest()
+                cached = (cache or {}).get(block_key)
+                if cached is not None:
+                    ct = cached
+                    print(f"[cache] 命中 caption 块 {bi}/{len(blocks)}（{len(ct)} 行），跳过", flush=True)
+                else:
+                    tr = self._chat_retry(base, key, model, block_text)
+                    ct = None
+                    if tr is not None:
+                        ct = tr.split("\n")
+                    if tr is None or len(ct) != len(blk):
+                        print(f"[translate] caption 块行数不符({-1 if ct is None else len(ct)} vs {len(blk)})，回退原文内容",
+                              flush=True)
+                        ct = [c for _, _, c in blk]
+                    elif cache is not None:
+                        cache[block_key] = ct
+                        self._save_tex_cache(cache_path, cache)
                 for (idx, holder, _c), tline in zip(blk, ct):
                     if out_lines[idx] is None:
                         out_lines[idx] = ""
@@ -907,6 +957,9 @@ class PdfTranslatorEngine:
         total = len(tex_files)
         if on_files:
             on_files(total)
+        # 断点续翻：任务级缓存（跨文件共享），存到 work_dir，进程重启后可续翻
+        cache_path = os.path.join(work_dir, "translation_cache.json")
+        cache = self._load_tex_cache(cache_path)
         for fi, tf in enumerate(tex_files):
             text = open(tf, encoding="utf-8", errors="ignore").read()
             # 修复4：纯命令文件（\input/\include 的 \newcommand 定义文件等）整体跳过翻译
@@ -926,6 +979,7 @@ class PdfTranslatorEngine:
             translated, note = self._translate_tex_content(
                 text, base, key, self.model, limit=limit,
                 on_block=_on_block if on_progress else None,
+                cache=cache, cache_path=cache_path,
             )
             if translated is None:
                 raise RuntimeError(f"翻译失败: {tf}: {note}")
@@ -980,10 +1034,12 @@ class PdfTranslatorEngine:
         pages, out_pdf = self._compile_tex_multi(str(src_dir), str(main_tex), out_pdf)
 
         pages_txt = f", {pages} 页" if pages else ""
+        cache_note = f"断点续翻缓存 {len(cache)} 块" if cache else "断点续翻缓存（全新翻译）"
         return (
             f"源码优先翻译完成（run_tex）\n"
             f"- 翻译 tex: {total} 个文件\n"
             f"- PDF: {out_pdf} ({os.path.getsize(out_pdf)} bytes{pages_txt})\n"
+            f"- {cache_note}: {cache_path}\n"
             f"- 说明: 保留原文档类，注入 ctex + hyperref[unicode=true]，"
             f"xelatex + bibtex 多遍编译"
         )
