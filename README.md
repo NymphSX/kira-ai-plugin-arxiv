@@ -14,19 +14,6 @@ arXiv 学术助手插件 v2.0.0 —— 由 `kira-ai-plugin-arxiv-search` 与 `pd
   - PDF 直接翻译：`pdf_path` → 提取 → 分块 → 翻译（断点续传）→ 重组 Markdown → xelatex 编译
   - 长 PDF 自动转后台任务（返回任务 ID、进度可查、完成推送）
 
-## 斜杠命令
-
-```
-/arxiv search <关键词> [-t]   搜索论文（-t 附带标题译文）
-/arxiv get <ID> [-t]         获取详情（-t 附带标题+摘要译文）
-/arxiv tr <ID>               翻译标题与摘要
-/arxiv dl <ID> [多个ID]      下载 PDF
-/arxiv src <ID>              下载 LaTeX 源码
-/arxiv help                  帮助
-```
-
-群聊使用需先 @ 机器人；私聊无需。
-
 ## LLM 工具
 
 | 工具 | 说明 |
@@ -39,6 +26,19 @@ arXiv 学术助手插件 v2.0.0 —— 由 `kira-ai-plugin-arxiv-search` 与 `pd
 | `parse_arxiv_command` | 代为执行 `/arxiv` 斜杠命令 |
 | `pdf_translate` | 论文翻译成中文 PDF（源码优先 + PDF 直接翻译） |
 | `query_pdf_translate_task` | 查询后台翻译任务状态 |
+
+## 斜杠命令
+
+```
+/arxiv search <关键词> [-t]   搜索论文（-t 附带标题译文）
+/arxiv get <ID> [-t]         获取详情（-t 附带标题+摘要译文）
+/arxiv tr <ID>               翻译标题与摘要
+/arxiv dl <ID> [多个ID]      下载 PDF
+/arxiv src <ID>              下载 LaTeX 源码
+/arxiv help                  帮助
+```
+
+群聊使用需先 @ 机器人；私聊无需。
 
 ## 配置
 
