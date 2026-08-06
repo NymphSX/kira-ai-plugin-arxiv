@@ -63,8 +63,8 @@ def find_kiraai_root():
     return None
 
 
-def load_cfg(root=None, base_url=None, api_key=None):
-    """读取 DeepSeek base_url / api_key。优先级: 显式传入 > 环境变量 > system_config.json。"""
+def load_cfg(root=None, provider_id="deepseek-main", base_url=None, api_key=None):
+    """读取 provider base_url / api_key。优先级: 显式传入 > 环境变量 > system_config.json providers[provider_id]。"""
     base_url = (base_url or "").strip() or os.environ.get("KIRAAI_BASE_URL", "").strip()
     api_key = (api_key or "").strip() or os.environ.get("KIRAAI_API_KEY", "").strip()
     if not base_url or not api_key:
@@ -75,11 +75,14 @@ def load_cfg(root=None, base_url=None, api_key=None):
                 "请设置环境变量 KIRAAI_ROOT 或 KIRAAI_BASE_URL/KIRAAI_API_KEY。"
             )
         d = json.load(open(os.path.join(root, "data/config/system_config.json"), encoding="utf-8"))
-        cfg = d["providers"]["deepseek-main"]["provider_config"]
-        base_url = base_url or cfg["base_url"]
-        api_key = api_key or cfg["api_key"]
+        prov = d.get("providers", {}).get(provider_id)
+        if prov is None:
+            raise RuntimeError(f"system_config.json 中未找到 provider: {provider_id}")
+        cfg = prov.get("provider_config", prov)
+        base_url = base_url or cfg.get("base_url")
+        api_key = api_key or cfg.get("api_key")
     if not base_url or not api_key:
-        raise RuntimeError("DeepSeek base_url/api_key 为空，请检查配置")
+        raise RuntimeError(f"provider {provider_id} 的 base_url/api_key 为空，请检查配置")
     return base_url.rstrip("/"), api_key
 
 
@@ -325,14 +328,15 @@ class PdfTranslatorEngine:
     """PDF → 中文 PDF 翻译引擎。可被 main.py 的 LLM 工具调用，也可被 CLI 直接驱动。"""
 
     def __init__(self, root=None, model=DEFAULT_MODEL, base_url=None, api_key=None,
-                 chunk_size=DEFAULT_BLOCK, output_dir=None, enable_mineru=False,
-                 header_footer_lines=None, header_footer_substrings=None):
+                 provider="deepseek-main", chunk_size=DEFAULT_BLOCK, output_dir=None,
+                 enable_mineru=False, header_footer_lines=None, header_footer_substrings=None):
         self.root = root or find_kiraai_root()
         if not self.root:
             raise RuntimeError("无法定位 KiraAI 根目录（缺少 data/config/system_config.json）")
         self.model = model or DEFAULT_MODEL
         self.base_url = base_url
         self.api_key = api_key
+        self.provider = provider or "deepseek-main"
         self.chunk_size = int(chunk_size or DEFAULT_BLOCK)
         self.output_dir = output_dir or os.path.join(self.root, "data/files/pdf_translator")
         self.enable_mineru = enable_mineru
@@ -501,7 +505,7 @@ class PdfTranslatorEngine:
                     or s.startswith("\\begin{") or s.startswith("\\end{")):
                 out_lines.append(line)
                 continue
-            # 挖出 \\caption{...}（含 \\caption[...]{...}）内容，保留命令前后缀
+            # 挖出 \caption{...}（含 \caption[...]{...}）内容，保留命令前后缀
             parts, pos = [], 0
             for m in self._TEX_CAP_RE.finditer(line):
                 parts.append(line[pos:m.start(1)])
@@ -593,6 +597,7 @@ class PdfTranslatorEngine:
         if not shutil.which("xelatex"):
             raise RuntimeError("未找到 xelatex（需要 TeX Live），请先安装")
         work_dir = os.path.abspath(work_dir)
+        # 编译前清缓存，避免增量编译脏状态
         for ext in (".aux", ".log", ".bbl", ".blg", ".toc", ".out",
                     ".lof", ".lot", ".xdv", ".bcf", ".run.xml", ".fls", ".fdb_latexmk"):
             for root, _dirs, fnames in os.walk(work_dir):
@@ -625,6 +630,7 @@ class PdfTranslatorEngine:
                 r = _run_xelatex()
                 log = (r.stdout or "") + (r.stderr or "")
                 if "Output written on" in log:
+                    # 新版格式: Output written on main.pdf (1 page). / 旧版: Output written on 1 page (...)
                     m = re.search(r"Output written on [^(\n]*\((\d+) page", log)
                     if m:
                         pages = int(m.group(1))
@@ -647,7 +653,7 @@ class PdfTranslatorEngine:
         if lang and lang != "zh":
             raise NotImplementedError(f"当前仅支持目标语言 zh，收到: {lang}")
 
-        base, key = load_cfg(self.root, self.base_url, self.api_key)
+        base, key = load_cfg(self.root, self.provider, self.base_url, self.api_key)
 
         # ---- 1. 获取/定位源码 → 工作副本 src/（绝不覆盖用户源文件） ----
         if on_stage:
@@ -703,7 +709,7 @@ class PdfTranslatorEngine:
         # ---- 2. 保留原文档类，注入 ctex + hyperref(unicode) ----
         self._inject_preamble(main_tex)
 
-        # ---- 3. 收集正文 tex（递归 \\input/\\include，.bib 不收集） ----
+        # ---- 3. 收集正文 tex（递归 \input/\include，.bib 不收集） ----
         tex_files = self._collect_tex_files(main_tex, str(src_dir))
         print("[run_tex] 待翻译 tex: "
               + ", ".join(os.path.relpath(f, src_dir) for f in tex_files), flush=True)
@@ -717,6 +723,7 @@ class PdfTranslatorEngine:
             translated, note = self._translate_tex_content(text, base, key, self.model, limit=limit)
             if translated is None:
                 raise RuntimeError(f"翻译失败: {tf}: {note}")
+            # LaTeX 输出前 sanitize_unicode 清洗
             cleaned = "\n".join(sanitize_unicode(ln) for ln in translated.split("\n"))
             with open(tf, "w", encoding="utf-8") as f:
                 f.write(cleaned)
@@ -755,10 +762,12 @@ class PdfTranslatorEngine:
         os.makedirs(self.output_dir, exist_ok=True)
 
         if chunks:
+            # 复用 prepare 的分块结果：跳过提取/分块，直接把 chunks.json 落盘保证后续一致性
             print(f"[1/5] 复用 prepare 分块结果（{len(chunks)} 块）", flush=True)
             with open(os.path.join(work_dir, "chunks.json"), "w", encoding="utf-8") as f:
                 json.dump(chunks, f, ensure_ascii=False, indent=1)
         else:
+            # 1. 提取
             if on_stage:
                 on_stage("extract")
             extractor = get_extractor(self.enable_mineru)
@@ -767,6 +776,7 @@ class PdfTranslatorEngine:
             with open(os.path.join(work_dir, "raw.txt"), "w", encoding="utf-8") as f:
                 f.write(raw)
 
+            # 2. 清洗分块
             if on_stage:
                 on_stage("chunk")
             print("[2/5] 清洗分块", flush=True)
@@ -785,6 +795,7 @@ class PdfTranslatorEngine:
         print(f"[3/5] 翻译 {len(merged)} 块 (limit={limit or '全部'})", flush=True)
         result = self._translate_merged(merged, md_path, prog_path, limit=limit, on_progress=on_progress)
 
+        # 4/5. 重组 MD + 编译 PDF
         if not os.path.exists(md_path) or os.path.getsize(md_path) < 10:
             raise RuntimeError(f"Markdown 为空，无法编译 PDF: {md_path}")
         print(f"[4/5] 重组 Markdown -> {md_path}", flush=True)
@@ -806,13 +817,14 @@ class PdfTranslatorEngine:
 
     # ---- 翻译（断点续传） ----
     def _translate_merged(self, merged, md_path, prog_path, limit=0, on_progress=None):
-        base, key = load_cfg(self.root, self.base_url, self.api_key)
+        base, key = load_cfg(self.root, self.provider, self.base_url, self.api_key)
         prog = {}
         if os.path.exists(prog_path):
             try:
                 prog = json.load(open(prog_path, encoding="utf-8"))
             except Exception:
                 prog = {}
+        # 无进度文件时清空旧 md，避免重复追加
         if not prog and os.path.exists(md_path):
             open(md_path, "w", encoding="utf-8").write("")
 
@@ -828,6 +840,7 @@ class PdfTranslatorEngine:
                 json.dump(prog, f, ensure_ascii=False, indent=1)
 
         for i in range(total):
+            # 进度回调：done 为当前已处理块数（含断点续传跳过的块，逐块累计 1..total）
             if on_progress:
                 on_progress(i + 1, total)
             typ, txt = merged[i]
@@ -916,6 +929,7 @@ class PdfTranslatorEngine:
         with open(tex, "w", encoding="utf-8") as f:
             f.write(self._latex_document(stem, secs))
 
+        # 编译前清理上次残留的辅助文件，避免增量编译脏状态
         for ext in (".aux", ".log", ".bbl", ".blg", ".toc", ".out", ".lof", ".lot"):
             p = os.path.join(work_dir, f"{stem}_zh{ext}")
             if os.path.exists(p):
@@ -957,12 +971,13 @@ def main(argv=None):
     ap.add_argument("--lang", default="zh", help="目标语言（当前仅支持 zh）")
     ap.add_argument("--limit", type=int, default=0, help="只翻译前 N 块（测试用）")
     ap.add_argument("--out", default=None, help="输出目录（默认 <KiraAI>/data/files/pdf_translator）")
-    ap.add_argument("--model", default=DEFAULT_MODEL, help=f"DeepSeek 模型（默认 {DEFAULT_MODEL}）")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help=f"翻译模型（默认 {DEFAULT_MODEL}）")
+    ap.add_argument("--provider", default="deepseek-main", help="provider_id（默认 deepseek-main，从 system_config providers 读取 base_url/api_key）")
     ap.add_argument("--enable-mineru", action="store_true", help="启用 Mineru 提取后端（未实现，会报错提示）")
     args = ap.parse_args(argv)
     try:
         engine = PdfTranslatorEngine(root=None, model=args.model, output_dir=args.out,
-                                     enable_mineru=args.enable_mineru)
+                                     provider=args.provider, enable_mineru=args.enable_mineru)
         if args.arxiv_id or args.tex:
             summary = engine.run_tex(arxiv_id=args.arxiv_id, tex_path=args.tex,
                                      limit=args.limit, lang=args.lang)
