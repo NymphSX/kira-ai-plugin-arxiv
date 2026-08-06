@@ -754,32 +754,174 @@ class PdfTranslatorEngine:
             print(f"[cache] 断点缓存写入失败: {e}", flush=True)
 
     @staticmethod
+    def _balanced_braces(s):
+        """忽略 \\verb 定界内容后判断花括号是否配对。
+        \\verb|}| 内的 } 是合法的单个 }（verb 原文），不参与配对计数。"""
+        depth = 0
+        i = 0
+        while i < len(s):
+            c = s[i]
+            if c == "\\":
+                nxt = PdfTranslatorEngine._skip_verb(s, i)
+                i = nxt if nxt > i else i + 2  # 转义对
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth < 0:
+                    return False
+            i += 1
+        return depth == 0
+
+    @staticmethod
+    def _skip_verb(line, i):
+        """若 line[i:] 是 \\verb 或 \\verb*，返回定界内容结束后的下标；否则返回 i。
+        \\verb 以紧随其后的第一个非空白字符为定界符，内容到下一个同字符为止。
+        （\\verb|}| 里的 } 不参与花括号配对，否则 caption 会被内部 } 提前截断）"""
+        if not line.startswith("\\verb", i):
+            return i
+        j = i + 5
+        if j < len(line) and line[j] == "*":
+            j += 1
+        while j < len(line) and line[j] in " \t":
+            j += 1
+        if j >= len(line):
+            return len(line)
+        d = line[j]
+        k = line.find(d, j + 1)
+        return len(line) if k == -1 else k + 1
+
+    @staticmethod
     def _iter_captions(line):
-        """迭代行内所有 \\caption[...]{...}，返回 (start, prefix, content, end)。
-        手写花括号配对解析，支持嵌套花括号（如 \\caption{...\\textit{FF Only}...}）。
-        _TEX_CAP_RE 的 [^}]* 遇到嵌套 } 会截断，导致 caption 内容被错误拆分，
-        翻译后括号不配对报 Extra }。"""
+        """迭代逻辑行内所有 \\caption / \\caption* [...] {...}，返回 (start, prefix, content, end)。
+        手写字符级扫描，支持：
+        - 嵌套花括号（\\textit{FF Only}）——弃用 _TEX_CAP_RE 的 [^}]*（遇嵌套 } 截断）
+        - \\verb/\\verb* 定界内容（内含 } 不参与配对）
+        - \\caption* 星号形式
+        - 可选参数 [ ... ] 内嵌 ]（括号深度计数）
+        - \\caption 与 { 之间允许空白
+        - 跨行 caption（逻辑行由 _merge_caption_lines 预先合并，本函数天然跨 \\n 扫描）"""
         pos = 0
         while True:
-            m = re.search(r"\\caption(?:\[[^\]]*\])?\{", line[pos:])
+            m = re.search(r"\\caption\*?", line[pos:])
             if not m:
                 return
-            start = pos + m.start()
-            brace = pos + m.end() - 1   # 指向 {
+            cmd_start = pos + m.start()
+            i = pos + m.end()
+            # 可选参数 [ ... ]
+            if i < len(line) and line[i] == "[":
+                depth = 0
+                while i < len(line):
+                    c = line[i]
+                    if c == "\\":
+                        nxt = PdfTranslatorEngine._skip_verb(line, i)
+                        i = nxt if nxt > i else i + 2  # 转义对（\\[ \\] 等）跳过
+                        continue
+                    if c == "[":
+                        depth += 1
+                    elif c == "]":
+                        depth -= 1
+                        if depth == 0:
+                            i += 1
+                            break
+                    i += 1
+                else:
+                    return  # 可选参数未闭合
+            # 允许空白
+            while i < len(line) and line[i] in " \t":
+                i += 1
+            if i >= len(line) or line[i] != "{":
+                pos = cmd_start + 1  # 不是 caption 组，继续向后找
+                continue
+            brace = i
             depth = 0
-            i = brace
-            while i < len(line):
-                if line[i] == "{":
+            j = brace
+            while j < len(line):
+                c = line[j]
+                if c == "\\":
+                    nxt = PdfTranslatorEngine._skip_verb(line, j)
+                    j = nxt if nxt > j else j + 2  # 转义对（\\{ \\} \\\\ 等）跳过
+                    continue
+                if c == "{":
                     depth += 1
-                elif line[i] == "}":
+                elif c == "}":
                     depth -= 1
                     if depth == 0:
-                        yield (start, line[start:brace + 1], line[brace + 1:i], i + 1)
-                        pos = i + 1
+                        yield (cmd_start, line[cmd_start:brace + 1], line[brace + 1:j], j + 1)
+                        pos = j + 1
                         break
-                i += 1
+                j += 1
             else:
-                return  # 未闭合，结束
+                return  # 未闭合
+
+    @staticmethod
+    def _caption_open_state(line):
+        """返回该行结束时仍未闭合的 caption 花括号深度（0=无未闭合 caption）。
+        供 _merge_caption_lines 判断多行 caption 是否需要续行合并。"""
+        depth = 0
+        in_cap = False
+        i = 0
+        while i < len(line):
+            c = line[i]
+            if c == "\\":
+                nxt = PdfTranslatorEngine._skip_verb(line, i)
+                if nxt > i:
+                    i = nxt
+                    continue
+                if not in_cap and line.startswith("\\caption", i):
+                    i += len("\\caption")
+                    if i < len(line) and line[i] == "*":
+                        i += 1
+                    if i < len(line) and line[i] == "[":
+                        k = line.find("]", i)
+                        if k == -1:
+                            return depth
+                        i = k + 1
+                    while i < len(line) and line[i] in " \t":
+                        i += 1
+                    if i < len(line) and line[i] == "{":
+                        in_cap = True
+                        depth = 1
+                        i += 1
+                    continue
+                i += 2  # 转义对
+                continue
+            if c == "{":
+                if in_cap:
+                    depth += 1
+            elif c == "}":
+                if in_cap:
+                    depth -= 1
+                    if depth <= 0:
+                        in_cap = False
+                        depth = 0
+            i += 1
+        return depth
+
+    @staticmethod
+    def _merge_caption_lines(text):
+        """把跨行的 \\caption{...} 合并成逻辑行（内嵌 \\n）。返回逻辑行列表。
+        只有 caption 未闭合才续行，普通多行文本不受影响。"""
+        lines = text.split("\n")
+        logical = []
+        buf = None
+        for ln in lines:
+            if buf is None:
+                d = PdfTranslatorEngine._caption_open_state(ln)
+                if d > 0:
+                    buf = ln
+                else:
+                    logical.append(ln)
+            else:
+                buf = buf + "\n" + ln
+                d = PdfTranslatorEngine._caption_open_state(ln)
+                if d == 0:
+                    logical.append(buf)
+                    buf = None
+        if buf is not None:
+            logical.append(buf)
+        return logical
 
     def _translate_tex_content(self, tex_text, base, key, model, limit=0, on_block=None,
                                cache=None, cache_path=None):
@@ -788,7 +930,7 @@ class PdfTranslatorEngine:
         pending = []    # (out_idx, protected_text, ph)
         captions = []   # (out_idx, holder, prefix, content, suffix)
 
-        for line in tex_text.split("\n"):
+        for line in self._merge_caption_lines(tex_text):
             s = line.strip()
             if (not s or s.startswith("%")
                     or s.startswith("\\begin{") or s.startswith("\\end{")):
@@ -796,15 +938,21 @@ class PdfTranslatorEngine:
                 continue
             # 挖出 \caption{...}（含 \caption[...]{...}）内容，保留命令前后缀。
             # 用花括号配对解析（支持嵌套 \textit{FF Only} 等），避免 _TEX_CAP_RE 截断。
+            # 关键：masked 必须保留 \caption{ 前缀和 } 后缀，只把内容用 holder 替代，
+            # 否则 \caption 命令会被吃掉，caption 变成纯文本。
             parts, pos = [], 0
             for cap_start, cap_prefix, content, cap_end in self._iter_captions(line):
                 parts.append(line[pos:cap_start])
                 holder = f"__KIRA_CAP_{len(captions)}__"
                 # 修复：caption 内容里的 LaTeX 命令（\textit 等）也必须保护，
                 # 否则翻译模型会弄坏花括号/命令结构（如多输出 } 导致 Extra } 编译错误）
-                cap_protected, cap_ph = self._protect_latex_line(content)
+                # 跨行 caption 的内容含 \n，折叠成空格（LaTeX 中 caption 内换行即空格），
+                # 保证 caption 块是单行，翻译行数与块数一致，否则多行 caption 永远回退不译
+                cap_protected, cap_ph = self._protect_latex_line(content.replace("\n", " "))
                 captions.append((len(out_lines), holder, cap_protected, cap_ph))
-                parts.append(holder)
+                parts.append(cap_prefix)   # 保留 \caption{ 前缀
+                parts.append(holder)       # 内容用占位符替代
+                parts.append("}")          # 保留闭合 }
                 pos = cap_end
             parts.append(line[pos:])
             masked = "".join(parts)
@@ -877,12 +1025,12 @@ class PdfTranslatorEngine:
                 if cur and cur_len + len(content) + 1 > BLOCK_LIMIT:
                     blocks.append(cur)
                     cur, cur_len = [], 0
-                cur.append((idx, holder, content))
+                cur.append((idx, holder, content, _ph))
                 cur_len += len(content) + 1
             if cur:
                 blocks.append(cur)
             for bi, blk in enumerate(blocks, 1):
-                block_text = "\n".join(c for _, _, c in blk)
+                block_text = "\n".join(c for _, _, c, _ in blk)
                 # 断点续翻：caption 块 md5 命中缓存则直接复用
                 block_key = hashlib.md5(block_text.encode("utf-8")).hexdigest()
                 cached = (cache or {}).get(block_key)
@@ -897,15 +1045,16 @@ class PdfTranslatorEngine:
                     if tr is None or len(ct) != len(blk):
                         print(f"[translate] caption 块行数不符({-1 if ct is None else len(ct)} vs {len(blk)})，回退原文内容",
                               flush=True)
-                        ct = [c for _, _, c in blk]
+                        ct = [c for _, _, c, _ in blk]
                     elif cache is not None:
                         cache[block_key] = ct
                         self._save_tex_cache(cache_path, cache)
                 for (idx, holder, content, ph), tline in zip(blk, ct):
-                    # 还原 caption 内容里的 LaTeX 占位符；还原失败（模型弄丢结构）回退原文，保证编译不炸
+                    # 还原 caption 内容里的 LaTeX 占位符；还原失败 或 花括号不配对
+                    # （模型弄坏结构，如多输出 }；\\verb 内的 } 不算）→ 回退还原后的原文
                     restored = self._restore_placeholders(tline, ph)
-                    if restored is None:
-                        restored = content
+                    if restored is None or not self._balanced_braces(restored):
+                        restored = self._restore_placeholders(content, ph) or content
                     if out_lines[idx] is None:
                         out_lines[idx] = ""
                     out_lines[idx] = out_lines[idx].replace(holder, restored)
