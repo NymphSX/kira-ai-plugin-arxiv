@@ -1,6 +1,14 @@
 {
     "max_results": {"type": "integer", "name": "默认搜索条数", "default": 5, "minimum": 1, "maximum": 20, "hint": "/arxiv search 默认返回的论文条数"},
+    "translation_model": {
+        "type": "model_select",
+        "model_type": "llm",
+        "name": "翻译模型",
+        "default": "",
+        "hint": "论文翻译（标题/摘要/LaTeX/PDF）使用的模型，格式 provider:model；留空=默认快速模型"
+    },
     "request_timeout": {"type": "integer", "name": "请求超时（秒）", "default": 15, "hint": "arXiv API 请求超时秒数；PDF 下载使用该值的 2 倍"},
+    "user_agent": {"type": "string", "name": "User-Agent", "default": "", "hint": "arXiv API 请求携带的 User-Agent；留空用内置默认（arXiv 官方要求带 UA，无 UA 易被限流）"},
     "sort_by": {"type": "enum", "name": "默认排序", "options": ["relevance", "submittedDate", "lastUpdatedDate"], "default": "relevance", "hint": "搜索结果排序：相关度 / 提交日期 / 最近更新"},
     "download_dir": {"type": "string", "name": "PDF 下载目录", "default": "data/files/arxiv_pdf", "hint": "PDF 保存目录（相对项目根目录，或绝对路径）"},
     "source_dir": {"type": "string", "name": "源码下载目录", "default": "data/files/arxiv_src", "hint": "LaTeX 源码包保存目录（相对项目根目录，或绝对路径）"},
@@ -9,44 +17,19 @@
         "enable_commands": {"type": "switch", "name": "启用斜杠命令", "default": true, "hint": "关闭后 /arxiv 命令不生效（LLM 工具仍可用）"},
         "slash_whitelist": {"type": "list", "name": "斜杠命令白名单", "default": [], "hint": "允许使用斜杠命令的 QQ 号（每行一个）；留空=不限制所有用户可用；使用斜杠命令需先 @机器人（私聊无需）"}
     }},
-    "translate": {"type": "section", "name": "翻译设置", "hint": "标题/摘要翻译相关配置（走内置多后端翻译引擎）", "collapsed": true, "fields": {
+    "translate": {"type": "section", "name": "翻译设置", "hint": "标题/摘要翻译相关配置（走默认快速模型）", "collapsed": true, "fields": {
         "translate_enabled": {"type": "switch", "name": "启用摘要翻译", "default": true, "hint": "关闭后 -t/--translate 参数与 arxiv_translate 工具不生效"},
-        "translate_lang": {"type": "enum", "name": "目标语言", "options": ["zh", "en", "ja", "ko"], "default": "zh", "hint": "摘要翻译目标语言"},
-        "translate_backend": {"type": "enum", "name": "摘要翻译后端", "options": ["fast", "auto", "baidu", "deepl", "google", "aliyun", "local"], "default": "fast", "hint": "fast=默认快速模型；auto=按翻译引擎回退链；其余=指定后端"}
+        "translate_lang": {"type": "enum", "name": "目标语言", "options": ["zh", "en", "ja", "ko"], "default": "zh", "hint": "摘要翻译目标语言"}
     }},
-    "translation": {"type": "section", "name": "翻译引擎", "collapsed": true, "fields": {
-        "enable_tool": {"type": "switch", "default": true, "name": "启用 translate 工具", "hint": "关闭后 LLM 无法调用 translate 工具，避免意外费用"},
-        "default_backend": {"type": "enum", "options": ["auto", "baidu", "deepl", "google", "aliyun", "local"], "default": "auto", "name": "默认后端", "hint": "auto=按顺序自动回退：百度→阿里云→DeepL→Google→本地模型"}
-    }},
-    "baidu": {"type": "section", "name": "百度翻译", "collapsed": true, "fields": {
-        "baidu_appid": {"type": "string", "default": "", "name": "APP ID"},
-        "baidu_secret_key": {"type": "sensitive", "default": "", "name": "密钥"}
-    }},
-    "deepl": {"type": "section", "name": "DeepL", "collapsed": true, "fields": {
-        "deepl_api_key": {"type": "sensitive", "default": "", "name": "API Key"},
-        "deepl_pro": {"type": "switch", "default": false, "name": "Pro 版", "hint": "开启使用 api.deepl.com，否则 api-free.deepl.com"}
-    }},
-    "google": {"type": "section", "name": "Google 翻译", "collapsed": true, "fields": {
-        "google_api_key": {"type": "sensitive", "default": "", "name": "Cloud API Key", "hint": "留空则该后端不可用（国内网络不通，建议仅海外部署时配置）"}
-    }},
-    "aliyun": {"type": "section", "name": "阿里云机器翻译", "collapsed": true, "fields": {
-        "aliyun_access_key_id": {"type": "sensitive", "default": "", "name": "AccessKey ID"},
-        "aliyun_access_key_secret": {"type": "sensitive", "default": "", "name": "AccessKey Secret"},
-        "aliyun_region": {"type": "string", "default": "cn-hangzhou", "name": "Region"}
-    }},
-    "local": {"type": "section", "name": "本地模型", "collapsed": true, "fields": {
-        "local_backend_url": {"type": "string", "default": "", "name": "服务地址", "hint": "Ollama 地址如 http://127.0.0.1:11434，或 OpenAI 兼容地址（以 /v1 结尾）"},
-        "local_model": {"type": "string", "default": "", "name": "模型名"},
-        "local_timeout": {"type": "integer", "default": 120, "name": "超时秒数"}
-    }},
-    "quota": {"type": "section", "name": "额度与限流", "collapsed": true, "fields": {
-        "max_chars_per_call": {"type": "integer", "default": 5000, "name": "单次最大字符数"},
-        "max_chars_per_day": {"type": "integer", "default": 10000, "name": "每会话每日最大字符数", "hint": "按会话分别计数；建议按所选后端免费额度下调，防止一夜烧穿月度免费量"},
-        "max_queries_per_min": {"type": "integer", "default": 30, "name": "每分钟最大请求数"},
-        "enable_cache": {"type": "switch", "default": true, "name": "启用翻译缓存", "hint": "相同文本+语对命中缓存，不消耗额度"}
-    }},
-    "pdf": {"type": "section", "name": "PDF 生成", "collapsed": true, "fields": {
-        "enable_pdf_tool": {"type": "switch", "default": true, "name": "启用 generate_pdf 工具", "hint": "关闭后 LLM 无法调用 generate_pdf 工具"},
-        "pdf_dir": {"type": "string", "default": "data/files", "name": "PDF 输出目录", "hint": "generate_pdf 输出目录（相对项目根目录，或绝对路径）"}
+    "section_pdf_translate": {"type": "section", "name": "PDF 翻译", "collapsed": false, "fields": {
+        "enable_tool": {"type": "switch", "name": "启用 pdf_translate 工具", "default": true, "hint": "关闭后 LLM 无法调用 pdf_translate 工具"},
+        "translation_model": {"type": "model_select", "model_type": "llm", "name": "翻译模型", "default": "3937f0fdf6b7:deepseek-v4-flash-0731", "hint": "翻译使用的模型（provider:model），默认快速模型；留空则用默认 LLM"},
+        "model": {"type": "string", "name": "翻译模型（旧字段，兼容）", "default": "deepseek-v4-flash", "hint": "兼容旧配置：translation_model 为空时回退该字段"},
+        "base_url": {"type": "string", "name": "API Base URL（覆盖全局）", "default": "", "hint": "留空则读取全局 system_config.json 的对应 provider 配置"},
+        "api_key": {"type": "string", "name": "API Key（覆盖全局）", "default": "", "hint": "留空则读取全局 system_config.json 的对应 provider 配置"},
+        "chunk_size": {"type": "integer", "name": "翻译块大小", "default": 1800, "minimum": 200, "hint": "合并后每块目标字符数（分块上限固定 1200）"},
+        "background_threshold": {"type": "integer", "name": "后台任务阈值（块数）", "default": 20, "minimum": 1, "hint": "翻译块数超过该值时自动提交为后台任务，立即返回任务 ID，进度可查（query_pdf_translate_task）"},
+        "output_dir": {"type": "string", "name": "输出目录", "default": "data/files/pdf_translator", "hint": "中文 Markdown 与 PDF 的输出目录（相对 KiraAI 根目录或绝对路径）"},
+        "enable_mineru": {"type": "switch", "name": "启用 Mineru 提取后端", "default": false, "hint": "false 时用 PyMuPDF 提取文本；true 时调用 Mineru（尚未实现，会报错提示）"}
     }}
 }
