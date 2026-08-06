@@ -14,19 +14,6 @@ arXiv 学术助手插件 v2.0.0 —— 由 `kira-ai-plugin-arxiv-search` 与 `pd
   - PDF 直接翻译：`pdf_path` → 提取 → 分块 → 翻译（断点续传）→ 重组 Markdown → xelatex 编译
   - 长 PDF 自动转后台任务（返回任务 ID、进度可查、完成推送）
 
-## LLM 工具
-
-| 工具 | 说明 |
-|------|------|
-| `arxiv_search` | 按关键词搜索 arXiv 论文 |
-| `arxiv_get` | 获取单篇论文详情 |
-| `arxiv_translate` | 标题与摘要翻译成中文 |
-| `arxiv_download` | 下载论文 PDF（支持批量） |
-| `arxiv_src` | 下载 LaTeX 源码包 |
-| `parse_arxiv_command` | 代为执行 `/arxiv` 斜杠命令 |
-| `pdf_translate` | 论文翻译成中文 PDF（源码优先 + PDF 直接翻译） |
-| `query_pdf_translate_task` | 查询后台翻译任务状态 |
-
 ## 斜杠命令
 
 ```
@@ -40,11 +27,24 @@ arXiv 学术助手插件 v2.0.0 —— 由 `kira-ai-plugin-arxiv-search` 与 `pd
 
 群聊使用需先 @ 机器人；私聊无需。
 
+## LLM 工具
+
+| 工具 | 说明 |
+|------|------|
+| `arxiv_search` | 按关键词搜索 arXiv 论文 |
+| `arxiv_get` | 获取单篇论文详情 |
+| `arxiv_translate` | 标题与摘要翻译成中文 |
+| `arxiv_download` | 下载论文 PDF（支持批量） |
+| `arxiv_src` | 下载 LaTeX 源码包 |
+| `parse_arxiv_command` | 代为执行 `/arxiv` 斜杠命令 |
+| `pdf_translate` | 论文翻译成中文 PDF（源码优先 + PDF 直接翻译） |
+| `query_pdf_translate_task` | 查询后台翻译任务状态 |
+
 ## 配置
 
 - **arXiv 设置**：默认搜索条数、请求超时、User-Agent、排序、下载目录
 - **翻译设置**：摘要翻译开关与目标语言
-- **PDF 翻译**：翻译模型（默认 deepseek-v4-flash）、API Base URL/Key 覆盖、分块大小、后台任务阈值、输出目录、Mineru 后端开关
+- **PDF 翻译**：翻译模型（model_select 下拉，默认快速模型 `3937f0fdf6b7:deepseek-v4-flash-0731`，留空回退旧字段/默认 LLM）、API Base URL/Key 覆盖（留空读对应 provider 配置）、分块大小、后台任务阈值、输出目录、Mineru 后端开关
 
 ## 依赖
 
