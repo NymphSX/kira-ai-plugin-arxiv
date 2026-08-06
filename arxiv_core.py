@@ -22,6 +22,9 @@ ARXIV_NS = "http://arxiv.org/schemas/atom"
 API_BASE = "https://export.arxiv.org/api/query"
 PDF_BASE = "https://arxiv.org/pdf/"
 
+# arXiv API 官方要求请求携带 User-Agent（无 UA 易被限流/封禁）；可用配置 user_agent 覆盖
+DEFAULT_USER_AGENT = "KiraAI-arxiv-plugin/2.0 (arxiv search plugin for KiraAI bot; contact: bot-admin)"
+
 # arXiv API 官方建议两次请求间隔 >= 3 秒
 MIN_API_INTERVAL = 3.0
 # PDF 并发下载上限
@@ -56,10 +59,12 @@ class ArxivClient:
         timeout: float = 15.0,
         sort_by: str = "relevance",
         max_results: int = 5,
+        user_agent: str = "",
     ):
         self.download_dir = download_dir
         self.source_dir = source_dir
         self.timeout = timeout
+        self.user_agent = (user_agent or "").strip() or DEFAULT_USER_AGENT
         self.sort_by = sort_by if sort_by in ("relevance", "submittedDate", "lastUpdatedDate") else "relevance"
         self.max_results = max(1, min(int(max_results or 5), 20))
         self._cache: Dict[str, Tuple[float, List[dict]]] = {}
@@ -140,7 +145,8 @@ class ArxivClient:
             if wait > 0:
                 await asyncio.sleep(wait)
             try:
-                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
+                                             headers={"User-Agent": self.user_agent}) as client:
                     resp = await client.get(API_BASE, params=params)
                     resp.raise_for_status()
                     content = resp.content
@@ -214,7 +220,8 @@ class ArxivClient:
         tmp_path = None
         async with _download_sem:
             try:
-                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
+                                             headers={"User-Agent": self.user_agent}) as client:
                     async with client.stream("GET", url) as resp:
                         resp.raise_for_status()
                         fd, tmp_name = tempfile.mkstemp(
@@ -286,7 +293,8 @@ class ArxivClient:
         size = 0
         async with _download_sem:
             try:
-                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
+                                             headers={"User-Agent": self.user_agent}) as client:
                     async with client.stream("GET", url) as resp:
                         resp.raise_for_status()
                         content_type = resp.headers.get("content-type", "")
