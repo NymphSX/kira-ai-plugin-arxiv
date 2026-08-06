@@ -116,14 +116,14 @@
     "type": "model_select",
     "model_type": "llm",
     "name": "翻译模型",
-    "default": "3937f0fdf6b7:deepseek-v4-flash-0731",
-    "hint": "翻译使用的模型（provider:model），默认快速模型；留空则用默认 LLM"
+    "default": "",
+    "hint": "翻译使用的模型（provider:model）；留空=使用默认快速模型（ctx 默认快速 LLM 客户端），不硬编码第三方 provider"
    },
    "model": {
     "type": "string",
     "name": "翻译模型（旧字段，兼容）",
     "default": "deepseek-v4-flash",
-    "hint": "兼容旧配置：translation_model 为空时回退该字段"
+    "hint": "兼容旧配置：ctx 未解析到模型时回退该字段"
    },
    "base_url": {
     "type": "string",
