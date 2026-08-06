@@ -796,6 +796,8 @@ class PdfTranslatorEngine:
                 continue
             # 挖出 \caption{...}（含 \caption[...]{...}）内容，保留命令前后缀。
             # 用花括号配对解析（支持嵌套 \textit{FF Only} 等），避免 _TEX_CAP_RE 截断。
+            # 关键：masked 必须保留 \caption{ 前缀和 } 后缀，只把内容用 holder 替代，
+            # 否则 \caption 命令会被吃掉，caption 变成纯文本。
             parts, pos = [], 0
             for cap_start, cap_prefix, content, cap_end in self._iter_captions(line):
                 parts.append(line[pos:cap_start])
@@ -804,7 +806,9 @@ class PdfTranslatorEngine:
                 # 否则翻译模型会弄坏花括号/命令结构（如多输出 } 导致 Extra } 编译错误）
                 cap_protected, cap_ph = self._protect_latex_line(content)
                 captions.append((len(out_lines), holder, cap_protected, cap_ph))
-                parts.append(holder)
+                parts.append(cap_prefix)   # 保留 \caption{ 前缀
+                parts.append(holder)       # 内容用占位符替代
+                parts.append("}")          # 保留闭合 }
                 pos = cap_end
             parts.append(line[pos:])
             masked = "".join(parts)
@@ -877,12 +881,12 @@ class PdfTranslatorEngine:
                 if cur and cur_len + len(content) + 1 > BLOCK_LIMIT:
                     blocks.append(cur)
                     cur, cur_len = [], 0
-                cur.append((idx, holder, content))
+                cur.append((idx, holder, content, _ph))
                 cur_len += len(content) + 1
             if cur:
                 blocks.append(cur)
             for bi, blk in enumerate(blocks, 1):
-                block_text = "\n".join(c for _, _, c in blk)
+                block_text = "\n".join(c for _, _, c, _ in blk)
                 # 断点续翻：caption 块 md5 命中缓存则直接复用
                 block_key = hashlib.md5(block_text.encode("utf-8")).hexdigest()
                 cached = (cache or {}).get(block_key)
@@ -897,15 +901,16 @@ class PdfTranslatorEngine:
                     if tr is None or len(ct) != len(blk):
                         print(f"[translate] caption 块行数不符({-1 if ct is None else len(ct)} vs {len(blk)})，回退原文内容",
                               flush=True)
-                        ct = [c for _, _, c in blk]
+                        ct = [c for _, _, c, _ in blk]
                     elif cache is not None:
                         cache[block_key] = ct
                         self._save_tex_cache(cache_path, cache)
                 for (idx, holder, content, ph), tline in zip(blk, ct):
-                    # 还原 caption 内容里的 LaTeX 占位符；还原失败（模型弄丢结构）回退原文，保证编译不炸
+                    # 还原 caption 内容里的 LaTeX 占位符；还原失败 或 花括号不配对
+                    # （模型弄坏结构，如多输出 }）→ 回退还原后的原文，保证编译不炸
                     restored = self._restore_placeholders(tline, ph)
-                    if restored is None:
-                        restored = content
+                    if restored is None or restored.count("{") != restored.count("}"):
+                        restored = self._restore_placeholders(content, ph) or content
                     if out_lines[idx] is None:
                         out_lines[idx] = ""
                     out_lines[idx] = out_lines[idx].replace(holder, restored)
