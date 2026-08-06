@@ -71,6 +71,8 @@ class ArxivPlugin(BasePlugin):
             sort_by=sort_by,
             max_results=max_results,
             user_agent=self._cfg("user_agent", ""),
+            # 下载 .part 临时文件放 data/temp（KiraAI 框架会自动清理），避免残留
+            temp_dir=self._resolve_dir("", "data/temp/arxiv_download"),
         )
 
     def _cfg(self, key: str, default=None):

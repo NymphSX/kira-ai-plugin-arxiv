@@ -60,9 +60,13 @@ class ArxivClient:
         sort_by: str = "relevance",
         max_results: int = 5,
         user_agent: str = "",
+        temp_dir: Optional[Path] = None,
     ):
         self.download_dir = download_dir
         self.source_dir = source_dir
+        # 下载 .part 临时文件目录：优先 temp_dir（框架会定期清理 data/temp），
+        # 缺省回退到对应保存目录（兼容旧行为）
+        self.temp_dir = temp_dir
         self.timeout = timeout
         self.user_agent = (user_agent or "").strip() or DEFAULT_USER_AGENT
         self.sort_by = sort_by if sort_by in ("relevance", "submittedDate", "lastUpdatedDate") else "relevance"
@@ -238,6 +242,9 @@ class ArxivClient:
         safe_id = self.sanitize_id(arxiv_id)
         save_dir = self.download_dir
         save_dir.mkdir(parents=True, exist_ok=True)
+        # .part 临时文件放 temp_dir（data/temp，框架自动清理），完成后 os.replace 到最终目录
+        tmp_dir = self.temp_dir or save_dir
+        tmp_dir.mkdir(parents=True, exist_ok=True)
         final_path = save_dir / f"{safe_id}.pdf"
         url = f"{PDF_BASE}{arxiv_id}"
         timeout = self.timeout * 2
@@ -250,7 +257,7 @@ class ArxivClient:
                     async with client.stream("GET", url) as resp:
                         resp.raise_for_status()
                         fd, tmp_name = tempfile.mkstemp(
-                            prefix=f".{safe_id}.", suffix=".part", dir=str(save_dir)
+                            prefix=f".{safe_id}.", suffix=".part", dir=str(tmp_dir)
                         )
                         tmp_path = Path(tmp_name)
                         size = 0
@@ -310,6 +317,9 @@ class ArxivClient:
         safe_id = self.sanitize_id(arxiv_id)
         save_dir = self.source_dir
         save_dir.mkdir(parents=True, exist_ok=True)
+        # .part 临时文件放 temp_dir（data/temp，框架自动清理），完成后 os.replace 到最终目录
+        tmp_dir = self.temp_dir or save_dir
+        tmp_dir.mkdir(parents=True, exist_ok=True)
         url = f"https://arxiv.org/e-print/{arxiv_id}"
         timeout = self.timeout * 2
 
@@ -324,7 +334,7 @@ class ArxivClient:
                         resp.raise_for_status()
                         content_type = resp.headers.get("content-type", "")
                         fd, tmp_name = tempfile.mkstemp(
-                            prefix=f".{safe_id}.", suffix=".part", dir=str(save_dir)
+                            prefix=f".{safe_id}.", suffix=".part", dir=str(tmp_dir)
                         )
                         tmp_path = Path(tmp_name)
                         with os.fdopen(fd, "wb") as fh:
