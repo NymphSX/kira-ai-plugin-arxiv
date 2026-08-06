@@ -157,6 +157,7 @@ class ArxivClient:
                                                  headers={"User-Agent": self.user_agent}) as client:
                         resp = await client.get(API_BASE, params=params)
                     if resp.status_code in (429,) or resp.status_code >= 500:
+                        last_exc = ArxivApiError(f"HTTP {resp.status_code}")
                         retry_after = 0.0
                         ra = resp.headers.get("Retry-After")
                         if ra:

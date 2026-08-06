@@ -863,7 +863,7 @@ class ArxivPlugin(BasePlugin):
                 }
                 async with _TASKS_LOCK:
                     _TASKS[task_id] = record
-                self._prune_tasks()  # 顺手清理已完成/失败任务，防内存泄漏
+                    self._prune_tasks()  # 顺手清理已完成/失败任务，防内存泄漏
                 self._schedule_background(
                     self._run_tex_task(
                         task_id, engine, arxiv_id or None, tex_path or None,
@@ -921,7 +921,7 @@ class ArxivPlugin(BasePlugin):
                     }
                     async with _TASKS_LOCK:
                         _TASKS[task_id] = record
-                    self._prune_tasks()  # 顺手清理已完成/失败任务，防内存泄漏
+                        self._prune_tasks()  # 顺手清理已完成/失败任务，防内存泄漏
                     self._schedule_background(
                         self._run_translate_task(
                             task_id, engine, pdf_path, target_lang, int(limit or 0), sid))
