@@ -753,6 +753,34 @@ class PdfTranslatorEngine:
         except Exception as e:
             print(f"[cache] 断点缓存写入失败: {e}", flush=True)
 
+    @staticmethod
+    def _iter_captions(line):
+        """迭代行内所有 \\caption[...]{...}，返回 (start, prefix, content, end)。
+        手写花括号配对解析，支持嵌套花括号（如 \\caption{...\\textit{FF Only}...}）。
+        _TEX_CAP_RE 的 [^}]* 遇到嵌套 } 会截断，导致 caption 内容被错误拆分，
+        翻译后括号不配对报 Extra }。"""
+        pos = 0
+        while True:
+            m = re.search(r"\\caption(?:\[[^\]]*\])?\{", line[pos:])
+            if not m:
+                return
+            start = pos + m.start()
+            brace = pos + m.end() - 1   # 指向 {
+            depth = 0
+            i = brace
+            while i < len(line):
+                if line[i] == "{":
+                    depth += 1
+                elif line[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        yield (start, line[start:brace + 1], line[brace + 1:i], i + 1)
+                        pos = i + 1
+                        break
+                i += 1
+            else:
+                return  # 未闭合，结束
+
     def _translate_tex_content(self, tex_text, base, key, model, limit=0, on_block=None,
                                cache=None, cache_path=None):
         """翻译 .tex 正文：保护 LaTeX 结构，\\caption 内容强制翻译。返回 (译文或 None, 说明)。"""
@@ -766,14 +794,18 @@ class PdfTranslatorEngine:
                     or s.startswith("\\begin{") or s.startswith("\\end{")):
                 out_lines.append(line)
                 continue
-            # 挖出 \caption{...}（含 \caption[...]{...}）内容，保留命令前后缀
+            # 挖出 \caption{...}（含 \caption[...]{...}）内容，保留命令前后缀。
+            # 用花括号配对解析（支持嵌套 \textit{FF Only} 等），避免 _TEX_CAP_RE 截断。
             parts, pos = [], 0
-            for m in self._TEX_CAP_RE.finditer(line):
-                parts.append(line[pos:m.start(1)])
+            for cap_start, cap_prefix, content, cap_end in self._iter_captions(line):
+                parts.append(line[pos:cap_start])
                 holder = f"__KIRA_CAP_{len(captions)}__"
-                captions.append((len(out_lines), holder, m.group(1), m.group(2), m.group(3)))
+                # 修复：caption 内容里的 LaTeX 命令（\textit 等）也必须保护，
+                # 否则翻译模型会弄坏花括号/命令结构（如多输出 } 导致 Extra } 编译错误）
+                cap_protected, cap_ph = self._protect_latex_line(content)
+                captions.append((len(out_lines), holder, cap_protected, cap_ph))
                 parts.append(holder)
-                pos = m.end(3)
+                pos = cap_end
             parts.append(line[pos:])
             masked = "".join(parts)
             protected, ph = self._protect_latex_line(masked)
@@ -841,7 +873,7 @@ class PdfTranslatorEngine:
         # ---- 翻译 caption 内容（合并一块；失败/行数不符回退原文内容，不逐条重译） ----
         if captions:
             blocks, cur, cur_len = [], [], 0
-            for (idx, holder, prefix, content, suffix) in captions:
+            for (idx, holder, content, _ph) in captions:
                 if cur and cur_len + len(content) + 1 > BLOCK_LIMIT:
                     blocks.append(cur)
                     cur, cur_len = [], 0
@@ -869,10 +901,14 @@ class PdfTranslatorEngine:
                     elif cache is not None:
                         cache[block_key] = ct
                         self._save_tex_cache(cache_path, cache)
-                for (idx, holder, _c), tline in zip(blk, ct):
+                for (idx, holder, content, ph), tline in zip(blk, ct):
+                    # 还原 caption 内容里的 LaTeX 占位符；还原失败（模型弄丢结构）回退原文，保证编译不炸
+                    restored = self._restore_placeholders(tline, ph)
+                    if restored is None:
+                        restored = content
                     if out_lines[idx] is None:
                         out_lines[idx] = ""
-                    out_lines[idx] = out_lines[idx].replace(holder, tline)
+                    out_lines[idx] = out_lines[idx].replace(holder, restored)
                 if on_block:                     # 修复B：caption 块级进度回调（每块一次）
                     on_block(bi, len(blocks))
 
