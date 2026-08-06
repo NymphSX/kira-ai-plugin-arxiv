@@ -86,7 +86,8 @@ def load_cfg(root=None, provider_id="deepseek-main", base_url=None, api_key=None
                 "找不到 KiraAI 根目录（data/config/system_config.json）。"
                 "请设置环境变量 KIRAAI_ROOT 或 KIRAAI_BASE_URL/KIRAAI_API_KEY。"
             )
-        d = json.load(open(os.path.join(root, "data/config/system_config.json"), encoding="utf-8"))
+        with open(os.path.join(root, "data/config/system_config.json"), encoding="utf-8") as fh:
+            d = json.load(fh)
         prov = d.get("providers", {}).get(provider_id)
         if prov is None:
             raise RuntimeError(f"system_config.json 中未找到 provider: {provider_id}")
@@ -490,14 +491,29 @@ class PdfTranslatorEngine:
 
     @staticmethod
     def _inject_preamble(main_tex):
-        """在根 tex 的 \\documentclass 行后注入 ctex + hyperref(unicode)，重复调用去重。"""
+        """在根 tex 的 \\documentclass 行后注入 ctex，hyperref 选项通过
+        \\PassOptionsToPackage 在 ctex 前传递（ctex 内部加载 hyperref，直接
+        \\usepackage{hyperref} 会导致选项冲突）。重复调用去重。"""
         p = str(main_tex)
         text = open(p, encoding="utf-8", errors="ignore").read()
         lines = text.split("\n")
+
+        # 1. 删除原 preamble 中任何显式 \usepackage[...]{hyperref} 行
+        #    （ctex 内部会加载 hyperref，重复加载会导致选项冲突）
+        new_lines = []
+        for ln in lines:
+            s = ln.strip()
+            if (s.startswith("\\usepackage") and "hyperref" in s
+                    and "PassOptionsToPackage" not in s):
+                continue  # 删掉
+            new_lines.append(ln)
+        lines = new_lines
+
+        # 2. 在 \documentclass 后注入 PassOptionsToPackage + ctex
         have = set(lines)
         inject = [
+            "\\PassOptionsToPackage{unicode=true,pdfencoding=auto,psdextra}{hyperref}",
             "\\usepackage[UTF8,fontset=fandol]{ctex}",
-            "\\usepackage[unicode=true,pdfencoding=auto,psdextra]{hyperref}",
         ]
         add = [x for x in inject if not any(x in h for h in have)]
         if add:
@@ -748,36 +764,33 @@ class PdfTranslatorEngine:
                             pass
         stem = os.path.splitext(os.path.basename(main_tex))[0]
         tex_name = stem + ".tex"
-        old = os.getcwd()
-        os.chdir(work_dir)
         log = ""
         pages = None
-        try:
-            def _run_xelatex():
-                return subprocess.run(
-                    ["xelatex", "-interaction=nonstopmode", "-halt-on-error", tex_name],
-                    capture_output=True, text=True, timeout=900)
+        def _run_xelatex():
+            return subprocess.run(
+                ["xelatex", "-interaction=nonstopmode", "-halt-on-error", tex_name],
+                capture_output=True, text=True, timeout=900, cwd=work_dir)
 
-            r = _run_xelatex()                      # 第 1 遍
+        r = _run_xelatex()                      # 第 1 遍
+        log = (r.stdout or "") + (r.stderr or "")
+        aux = os.path.join(work_dir, stem + ".aux")
+        if os.path.exists(aux):
+            with open(aux, encoding="utf-8", errors="ignore") as fh:
+                aux_text = fh.read()
+            if "\\bibdata" in aux_text and shutil.which("bibtex"):
+                subprocess.run(["bibtex", stem], capture_output=True, text=True, timeout=300,
+                               cwd=work_dir)
+        for _i in range(2):                     # 第 2-3 遍（含引用/目录稳定）
+            r = _run_xelatex()
             log = (r.stdout or "") + (r.stderr or "")
-            aux = os.path.join(work_dir, stem + ".aux")
-            if os.path.exists(aux):
-                aux_text = open(aux, encoding="utf-8", errors="ignore").read()
-                if "\\bibdata" in aux_text and shutil.which("bibtex"):
-                    subprocess.run(["bibtex", stem], capture_output=True, text=True, timeout=300)
-            for _i in range(2):                     # 第 2-3 遍（含引用/目录稳定）
-                r = _run_xelatex()
-                log = (r.stdout or "") + (r.stderr or "")
-                if "Output written on" in log:
-                    # 新版格式: Output written on main.pdf (1 page). / 旧版: Output written on 1 page (...)
-                    m = re.search(r"Output written on [^(\n]*\((\d+) page", log)
-                    if m:
-                        pages = int(m.group(1))
-                    break
-            if "Output written on" not in log:
-                raise RuntimeError("xelatex 编译失败（未输出 'Output written on'）：\n" + log[-1500:])
-        finally:
-            os.chdir(old)
+            if "Output written on" in log:
+                # 新版格式: Output written on main.pdf (1 page). / 旧版: Output written on 1 page (...)
+                m = re.search(r"Output written on [^(\n]*\((\d+) page", log)
+                if m:
+                    pages = int(m.group(1))
+                break
+        if "Output written on" not in log:
+            raise RuntimeError("xelatex 编译失败（未输出 'Output written on'）：\n" + log[-1500:])
         src_pdf = os.path.join(work_dir, stem + ".pdf")
         if not os.path.exists(src_pdf):
             raise RuntimeError("xelatex 未生成 PDF 文件")
@@ -1162,23 +1175,18 @@ class PdfTranslatorEngine:
             if os.path.exists(p):
                 os.remove(p)
 
-        old_cwd = os.getcwd()
-        os.chdir(work_dir)
-        try:
-            log = ""
-            ok = False
-            for i in range(3):   # 最多三遍编译生成目录
-                r = subprocess.run(
-                    ["xelatex", "-interaction=nonstopmode", os.path.basename(tex)],
-                    capture_output=True, text=True, timeout=600)
-                log = (r.stdout or "") + (r.stderr or "")
-                if "Output written on" in log:
-                    ok = True
-                    break
-            if not ok:
-                raise RuntimeError(f"xelatex 编译失败(3遍均未生成 PDF):\n" + log[-1500:])
-        finally:
-            os.chdir(old_cwd)
+        log = ""
+        ok = False
+        for i in range(3):   # 最多三遍编译生成目录
+            r = subprocess.run(
+                ["xelatex", "-interaction=nonstopmode", os.path.basename(tex)],
+                capture_output=True, text=True, timeout=600, cwd=work_dir)
+            log = (r.stdout or "") + (r.stderr or "")
+            if "Output written on" in log:
+                ok = True
+                break
+        if not ok:
+            raise RuntimeError(f"xelatex 编译失败(3遍均未生成 PDF):\n" + log[-1500:])
 
         src_pdf = os.path.join(work_dir, f"{stem}_zh.pdf")
         if not os.path.exists(src_pdf):

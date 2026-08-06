@@ -449,7 +449,7 @@ class ArxivPlugin(BasePlugin):
             return f"❌ 未找到 arXiv 论文：{arxiv_id.strip()}"
         if not self._cfg("translate_enabled", True):
             return "❌ 翻译功能已在配置中关闭（translate_enabled=false），可先用 /arxiv get 查看原文"
-        client = self.ctx.get_default_llm_client()
+        client = self._get_translation_client()
         if not client:
             return "❌ 翻译服务不可用，先试试 /arxiv get"
         try:
@@ -550,7 +550,7 @@ class ArxivPlugin(BasePlugin):
           不硬编码第三方 provider；
         - 兜底：旧字段 model（兼容）与内置默认。"""
         s = self.plugin_cfg.get("section_pdf_translate", {}) or {}
-        translation_model = (s.get("translation_model") or "").strip()
+        translation_model = (s.get("pdf_translation_model") or s.get("translation_model") or "").strip()
 
         # 解析 provider/model：优先 translation_model（provider_id:model_id），
         # 回退逻辑与 _get_translation_client() 完全一致
@@ -991,7 +991,7 @@ class ArxivPlugin(BasePlugin):
         chain = getattr(msg, "chain", None) if msg is not None else None
         if chain is not None:
             return any(
-                getattr(ele, "pid", None) == bot_id
+                any(str(getattr(ele, f, "")) == bot_id for f in ("pid", "target", "qq") if hasattr(ele, f))
                 for ele in chain
                 if isinstance(ele, At)
             )

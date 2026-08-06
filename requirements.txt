@@ -1,7 +1,7 @@
 httpx>=0.24
 pymupdf>=1.24.0
 
-# 可选：仅用于冒烟测试生成小 PDF，非运行必需
+# optional smoke-test only
 reportlab>=4.0
 
-# 系统依赖（非 pip）：xelatex（TeXLive，含 ctex 宏包），用于编译中文 PDF
+# system dep: xelatex (TeXLive + ctex) for Chinese PDF

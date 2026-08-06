@@ -1,2 +1,18 @@
-__pycache_/
+__pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 运行时数据目录（下载的 PDF、源码、翻译中间文件）
+data/files/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
