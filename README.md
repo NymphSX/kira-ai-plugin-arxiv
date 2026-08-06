@@ -52,7 +52,32 @@ arXiv 学术助手插件 v2.0.0 —— 由 `kira-ai-plugin-arxiv-search` 与 `pd
 pip install -r requirements.txt
 ```
 
-系统依赖：`xelatex`（TeXLive，含 `ctex` 宏包）用于编译中文 PDF。
+**系统依赖：必须安装 TeX Live（完整版，含 `xelatex`、`ctex` 宏包与 `bibtex`）**，用于将翻译结果编译为中文 PDF。缺少任一组件会导致 PDF 编译失败：
+
+- `xelatex`：主编译器（PDF 翻译与源码优先翻译均依赖）
+- `ctex` 宏包：中文排版支持（缺少会报 `ctex.sty not found`）
+- `bibtex`：参考文献编译（源码优先翻译保留参考文献时使用）
+
+各平台安装参考：
+
+```bash
+# Ubuntu / Debian
+apt install texlive-xetex texlive-lang-chinese texlive-bibtex-extra
+
+# macOS（推荐完整版 MacTeX）
+brew install --cask mactex
+
+# Windows
+# 安装 TeX Live 完整版：https://tug.org/texlive/
+```
+
+验证安装：
+
+```bash
+xelatex --version && kpsewhich ctex.sty
+```
+
+若 `kpsewhich ctex.sty` 无输出，说明缺少 ctex 宏包，请安装对应语言包。
 
 ## 许可
 
