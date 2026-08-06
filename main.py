@@ -1,5 +1,5 @@
 """
-KiraAI arXiv 学术助手插件 (kira-ai-plugin-arxiv) v2.1.0
+KiraAI arXiv 学术助手插件 (kira-ai-plugin-arxiv) v2.1.1
 
 由两个插件合并而来：
 - kira-ai-plugin-arxiv-search（arXiv 查询/下载/摘要翻译）
