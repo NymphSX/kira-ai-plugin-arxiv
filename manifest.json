@@ -1,7 +1,7 @@
 {
   "display_name": "arXiv 学术助手",
   "plugin_id": "kira-ai-plugin-arxiv",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "core_version": ">=2.24.2",
   "author": "陈舒昕 & Orion",
   "description": "arXiv 论文查询、翻译与下载，内置论文翻译中文 PDF 引擎（源码优先翻译 + PDF 直接翻译 + 后台任务）：/arxiv search/get/tr/dl/src 论文操作；LLM 工具 arxiv_search/arxiv_get/arxiv_translate/arxiv_download/arxiv_src/parse_arxiv_command/pdf_translate/query_pdf_translate_task。基于 arXiv 官方 API。",
