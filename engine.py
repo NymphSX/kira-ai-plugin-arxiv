@@ -127,11 +127,40 @@ class _TimeoutHTTPSHandler(urllib.request.HTTPSHandler):
                             read_timeout=self._read_timeout)
 
 
+# ---- 请求工厂：请求头 / opener 预先备好并缓存，避免每次调用重建 ----
+# opener 按 (connect_timeout, read_timeout) 缓存；headers 按 api_key 缓存。
+# 均为只读多写少的 dict，CPython GIL 下 get/set 原子；opener 并发 open 线程安全。
+_opener_cache = {}
+_headers_cache = {}
+
+
+def _get_opener(connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT):
+    """按超时参数复用预构建的 urllib opener。"""
+    key = (connect_timeout, read_timeout)
+    op = _opener_cache.get(key)
+    if op is None:
+        op = urllib.request.build_opener(
+            _TimeoutHTTPSHandler(connect_timeout=connect_timeout,
+                                 read_timeout=read_timeout))
+        _opener_cache[key] = op
+    return op
+
+
+def _get_headers(api_key):
+    """按 api_key 复用预构建的请求头（Key 不变时不重复构造 dict）。"""
+    h = _headers_cache.get(api_key)
+    if h is None:
+        h = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        _headers_cache[api_key] = h
+    return h
+
+
 def chat(base, key, model, text, connect_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT):
     """调用 DeepSeek chat/completions，返回译文。
     - 修复A：请求体显式关闭深度推理（thinking.enabled=false），翻译任务不需要推理，避免单次 1~3 分钟；
     - 修复D：max_tokens 按输入长度动态估算（min(3000, max(1200, len*0.8))），降低长块截断概率；
-    - 修复A：超时拆分为 connect/read 两段，默认 connect 30s + read 120s。"""
+    - 修复A：超时拆分为 connect/read 两段，默认 connect 30s + read 120s；
+    - 请求头 / opener 预先备好并缓存（_get_headers / _get_opener），避免每次调用重建。"""
     body = {
         "model": model,
         "messages": [{"role": "system", "content": SYSTEM},
@@ -143,12 +172,10 @@ def chat(base, key, model, text, connect_timeout=CONNECT_TIMEOUT, read_timeout=R
     req = urllib.request.Request(
         f"{base}/chat/completions",
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+        headers=_get_headers(key),
     )
-    opener = urllib.request.build_opener(
-        _TimeoutHTTPSHandler(connect_timeout=connect_timeout, read_timeout=read_timeout))
     try:
-        with opener.open(req) as r:
+        with _get_opener(connect_timeout, read_timeout).open(req) as r:
             data = json.loads(r.read().decode("utf-8"))
     except Exception as e:
         print(f"[chat] 调用失败 {type(e).__name__}: {e}", flush=True)
