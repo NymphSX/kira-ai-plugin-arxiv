@@ -662,6 +662,34 @@ class ArxivPlugin(BasePlugin):
         lines.append(f"⏱ 耗时：{elapsed:.0f}s")
         return "\n".join(lines)
 
+    @staticmethod
+    def _list_tasks() -> str:
+        """列出当前所有活跃的后台翻译任务（pending + running）。"""
+        tasks = [(tid, t) for tid, t in _TASKS.items() if t.get("status") in ("pending", "running")]
+        if not tasks:
+            # 也看看有没有已完成/失败的任务
+            all_tasks = list(_TASKS.items())
+            if not all_tasks:
+                return "📭 当前没有后台翻译任务"
+            done_count = sum(1 for _, t in all_tasks if t.get("status") == "done")
+            fail_count = sum(1 for _, t in all_tasks if t.get("status") == "failed")
+            return f"📭 无进行中的任务（已完成 {done_count} 个，失败 {fail_count} 个）"
+        lines = [f"📋 当前后台翻译任务（共 {len(tasks)} 个）：", ""]
+        for tid, t in tasks:
+            st = t.get("status", "?")
+            icon = "⏳" if st == "pending" else "🔄"
+            stage = t.get("stage", "?")
+            done = t.get("done_blocks", 0)
+            total = t.get("total_blocks", 0)
+            pdf = t.get("pdf_path", t.get("arxiv_id", "-"))
+            if len(pdf) > 40:
+                pdf = pdf[:37] + "..."
+            progress = f" {done}/{total} 块" if total else ""
+            lines.append(f"  {icon} `{tid}` | {stage}{progress} | {pdf}")
+        lines.append("")
+        lines.append("用法：/arxiv task <任务ID> 查看详情")
+        return "\n".join(lines)
+
     async def _run_translate_task(self, task_id, engine, pdf_path, target_lang, limit, sid):
         """后台执行 PDF 翻译：全程更新任务状态并推送进度，完成后推送结果路径。"""
         try:
@@ -1048,13 +1076,16 @@ class ArxivPlugin(BasePlugin):
             f"🀄 {prefix} tr <arXiv ID> — 将单篇论文的标题与摘要翻译成中文\n"
             f"⬇️  {prefix} dl <arXiv ID> [多个ID] — 下载 PDF 到 data/files/arxiv_pdf/\n"
             f"📦 {prefix} src <arXiv ID> — 下载 LaTeX 源码包到 data/files/arxiv_src/\n"
+            f"📊 {prefix} task [任务ID] — 查后台翻译任务进度（不传 ID 列出所有任务）\n"
             f"ℹ️  {prefix} help — 查看帮助\n\n"
             f"示例：\n"
             f"  {prefix} search large language model\n"
             f"  {prefix} get 1706.03762\n"
             f"  {prefix} tr 1706.03762\n"
             f"  {prefix} dl 1706.03762\n"
-            f"  {prefix} src 1706.03762"
+            f"  {prefix} src 1706.03762\n"
+            f"  {prefix} task              # 列出所有活跃任务\n"
+            f"  {prefix} task PDFTR...123   # 查看指定任务详情"
         )
 
     async def _parse_and_execute(self, text: str, event) -> str:
@@ -1099,6 +1130,12 @@ class ArxivPlugin(BasePlugin):
             if not args:
                 return "❌ 用法：/arxiv dl <arXiv ID> [更多ID...]，例如 /arxiv dl 1706.03762"
             return await self.tool_arxiv_download(event, " ".join(args))
+
+        if sub in ("task", "progress", "status"):
+            if not args:
+                # 列出所有活跃任务
+                return self._list_tasks()
+            return self._format_task(args[0])
 
         return f"❌ 未知子命令：{sub}\n\n{self._help_text()}"
 

@@ -35,6 +35,7 @@ arXiv 学术助手插件 v2.0.1 —— 由 `kira-ai-plugin-arxiv-search` 与 `pd
 /arxiv tr <ID>               翻译标题与摘要
 /arxiv dl <ID> [多个ID]      下载 PDF
 /arxiv src <ID>              下载 LaTeX 源码
+/arxiv task [任务ID]          查后台翻译任务进度（不传 ID 列出全部）
 /arxiv help                  帮助
 ```
 

@@ -10,7 +10,7 @@
   "locales": {
     "zh": {
       "display_name": "arXiv 学术助手",
-      "description": "arXiv 论文查询、翻译与下载，内置论文翻译中文 PDF 引擎：/arxiv search <关键词> [-t] 搜索、/arxiv get <ID> 获取详情、/arxiv tr <ID> 标题摘要翻译、/arxiv dl <ID> 下载 PDF、/arxiv src <ID> 下载 LaTeX 源码；pdf_translate 支持源码优先翻译与 PDF 直接翻译，长文档自动转后台任务。"
+      "description": "arXiv 论文查询、翻译与下载，内置论文翻译中文 PDF 引擎：/arxiv search <关键词> [-t] 搜索、/arxiv get <ID> 获取详情、/arxiv tr <ID> 标题摘要翻译、/arxiv dl <ID> 下载 PDF、/arxiv src <ID> 下载 LaTeX 源码、/arxiv task [任务ID] 查后台翻译进度；pdf_translate 支持源码优先翻译与 PDF 直接翻译，长文档自动转后台任务。"
     },
     "en": {
       "display_name": "arXiv Academic Assistant",
