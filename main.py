@@ -39,8 +39,6 @@ log = logging.getLogger(__name__)
 
 # PDF 翻译默认模型（model_select 未配置时兜底，与 engine.DEFAULT_MODEL 一致）
 DEFAULT_TRANSLATE_MODEL = "deepseek-v4-flash"
-# 默认翻译模型 = 快速模型（R4，model_select 下拉默认值，provider_id:model_id）
-DEFAULT_FAST_MODEL = "3937f0fdf6b7:deepseek-v4-flash-0731"
 
 # ── 后台翻译任务注册表（模块级，跨实例共享）──
 # task_id → 任务状态 dict；asyncio.Lock 保证同一事件循环内对字典的读写串行化
@@ -202,11 +200,18 @@ class ArxivPlugin(BasePlugin):
                 if done == total or done % step == 0:
                     try:
                         asyncio.run_coroutine_threadsafe(
-                            self._send_to_session(sid, f"📖 翻译进度 {done}/{total} 个 tex 文件"),
+                            self._send_to_session(sid, f"📖 翻译进度：已完成 {done}/{total} 块"),
                             _loop,
                         )
                     except Exception as e:
                         logger.warning("推送后台任务 %s 进度失败: %s", task_id, e)
+
+            def _on_files(total_files):
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self._update_task(task_id, total_files=int(total_files)), _loop)
+                except Exception as e:
+                    logger.warning("更新后台任务 %s 文件数失败: %s", task_id, e)
 
             summary = await asyncio.to_thread(
                 engine.run_tex,
@@ -216,6 +221,7 @@ class ArxivPlugin(BasePlugin):
                 lang=target_lang,
                 on_stage=_on_stage,
                 on_progress=_on_progress,
+                on_files=_on_files,
             )
             result_pdf = ""
             for line in str(summary).splitlines():
@@ -536,21 +542,43 @@ class ArxivPlugin(BasePlugin):
 
     def _engine(self) -> PdfTranslatorEngine:
         """根据插件配置（schema section_pdf_translate）构造引擎实例。
-        翻译模型支持 model_select（translation_model 存 provider_id:model_id），
-        空则回退旧字段 model（兼容），再回退默认快速模型。"""
+        翻译模型 model_select（translation_model 存 provider_id:model_id）：
+        - 配置了 translation_model：与摘要翻译 _get_translation_client() 一致，
+          用 ctx.get_llm_client(model_uuid=...) 解析 provider/model；
+        - 留空/解析失败：回退 ctx 默认快速 LLM 客户端
+          （ctx.get_default_fast_llm_client() or ctx.get_default_llm_client()），
+          不硬编码第三方 provider；
+        - 兜底：旧字段 model（兼容）与内置默认。"""
         s = self.plugin_cfg.get("section_pdf_translate", {}) or {}
         translation_model = (s.get("translation_model") or "").strip()
-        model = (s.get("model") or "").strip() or DEFAULT_TRANSLATE_MODEL
-        provider = "deepseek-main"
+
+        # 解析 provider/model：优先 translation_model（provider_id:model_id），
+        # 回退逻辑与 _get_translation_client() 完全一致
+        client = None
         if translation_model:
-            if ":" in translation_model:
-                provider, model = translation_model.split(":", 1)
-            else:
-                model = translation_model
+            try:
+                client = self.ctx.get_llm_client(model_uuid=translation_model)
+                if client is None:
+                    logger.warning("translation_model 解析为空（%s），回退默认快速模型", translation_model)
+            except Exception as e:
+                logger.warning("translation_model 解析失败（%s），回退快速模型: %s", translation_model, e)
+        if client is None:
+            client = self.ctx.get_default_fast_llm_client() or self.ctx.get_default_llm_client()
+
+        provider = model = None
+        if client is not None:
+            provider = getattr(client.model, "provider_id", None)
+            model = getattr(client.model, "model_id", None)
+        # 兜底：旧字段 model（兼容）与内置默认
+        if not model:
+            model = (s.get("model") or "").strip() or DEFAULT_TRANSLATE_MODEL
+        if not provider:
+            provider = "deepseek-main"
+
         return PdfTranslatorEngine(
             root=None,  # engine 自动向上定位 KiraAI 根目录
-            model=model or DEFAULT_TRANSLATE_MODEL,
-            provider=provider or "deepseek-main",
+            model=model,
+            provider=provider,
             base_url=(s.get("base_url") or "").strip() or None,
             api_key=(s.get("api_key") or "").strip() or None,
             chunk_size=int(s.get("chunk_size") or 1800),
@@ -614,10 +642,14 @@ class ArxivPlugin(BasePlugin):
         ]
         total = task.get("total_blocks", 0)
         done = task.get("done_blocks", 0)
+        total_files = task.get("total_files", 0)
         if total:
-            lines.append(f"📖 翻译进度：{done}/{total} 块")
+            lines.append(f"📖 翻译进度：已完成 {done}/{total} 块")
         elif status in ("running", "pending"):
-            lines.append("📖 翻译进度：尚未开始分块")
+            if total_files:
+                lines.append(f"📖 翻译进度：正在翻译第 1 个文件（共 {total_files} 个），已完成 0 块")
+            else:
+                lines.append("📖 翻译进度：正在准备（下载/提取/清洗中），块级进度将在翻译开始后显示")
         if task.get("result_md"):
             lines.append(f"📝 Markdown：{task['result_md']}")
         if task.get("result_pdf"):
