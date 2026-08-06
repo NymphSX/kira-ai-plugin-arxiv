@@ -196,15 +196,7 @@ class ArxivPlugin(BasePlugin):
                     )
                 except Exception as e:
                     logger.warning("更新后台任务 %s 进度失败: %s", task_id, e)
-                step = 1 if total <= 10 else 5
-                if done == total or done % step == 0:
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            self._send_to_session(sid, f"📖 翻译进度：已完成 {done}/{total} 块"),
-                            _loop,
-                        )
-                    except Exception as e:
-                        logger.warning("推送后台任务 %s 进度失败: %s", task_id, e)
+                self._report_progress(sid, task_id, done, total, _loop)
 
             def _on_files(total_files):
                 try:
@@ -690,6 +682,27 @@ class ArxivPlugin(BasePlugin):
         lines.append("用法：/arxiv task <任务ID> 查看详情")
         return "\n".join(lines)
 
+    def _report_progress(self, sid: str, task_id: str, done, total, loop) -> None:
+        """汇报后台翻译进度。debug.progress_report 开关开启时才推送到会话；
+        默认关闭，进度只写日志（logger），不打扰用户。按步长节流推送。"""
+        try:
+            done = int(done)
+            total = int(total)
+        except (TypeError, ValueError):
+            return
+        step = 1 if total <= 10 else 5
+        if done != total and done % step != 0:
+            return
+        msg = f"📖 翻译进度：已完成 {done}/{total} 块"
+        if self._cfg("progress_report", False):
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._send_to_session(sid, msg), loop)
+            except Exception as e:
+                logger.warning("推送后台任务 %s 进度失败: %s", task_id, e)
+        else:
+            logger.info("后台任务 %s 进度：%s（debug.progress_report 关闭，不推送 QQ）", task_id, msg)
+
     async def _run_translate_task(self, task_id, engine, pdf_path, target_lang, limit, sid):
         """后台执行 PDF 翻译：全程更新任务状态并推送进度，完成后推送结果路径。"""
         try:
@@ -714,15 +727,7 @@ class ArxivPlugin(BasePlugin):
                     )
                 except Exception as e:
                     logger.warning("更新后台任务 %s 进度失败: %s", task_id, e)
-                step = 1 if total <= 10 else 5
-                if done == total or done % step == 0:
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            self._send_to_session(sid, f"📖 翻译进度 {done}/{total} 块"),
-                            _loop,
-                        )
-                    except Exception as e:
-                        logger.warning("推送后台任务 %s 进度失败: %s", task_id, e)
+                self._report_progress(sid, task_id, done, total, _loop)
 
             summary = await asyncio.to_thread(
                 engine.run, pdf_path, limit, target_lang,

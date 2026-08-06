@@ -164,5 +164,18 @@
     "hint": "false 时用 PyMuPDF 提取文本；true 时调用 Mineru（尚未实现，会报错提示）"
    }
   }
+ },
+ "section_debug": {
+  "type": "section",
+  "name": "调试",
+  "collapsed": true,
+  "fields": {
+   "progress_report": {
+    "type": "switch",
+    "name": "后台任务进度汇报",
+    "default": false,
+    "hint": "关闭（默认）时后台翻译的块级进度只写入日志（logger），不推送到 QQ；开启后才向会话推送进度消息。完成/失败通知不受此开关影响，始终推送"
+   }
+  }
  }
 }
