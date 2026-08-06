@@ -353,12 +353,57 @@ _MATH_UNI = {
     "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
 }
 
-def sanitize_unicode(text):
-    """编译前清洗进入 LaTeX 的文本：数学符号→LaTeX、引号规范；emoji/私用区/不可打印字符删除或替换并告警。"""
+# 数学特征字符：希腊字母 / 数学运算符符号 / Unicode 下标上标
+_GREEK_RE = re.compile(r"[\u0370-\u03ff\u1f00-\u1fff]")
+_MATH_OPS_RE = re.compile(r"[=+\-−×÷≤≥≠±√∑∏∫∈⊂⊃∪∩∞∂∇≈≡⇒⇔→←↑↓]")
+_WORD_RE = re.compile(r"[A-Za-z]{3,}")
+
+
+def protect_math(text):
+    """把明显的公式行用 $...$ 包裹，防止被翻译模型当正文乱译。
+    判定（保守，避免误伤普通句子）：
+      - 行内含希腊字母（学术论文中几乎只出现在公式）；
+      - 或含数学运算符且不含连续英文单词（≥3 字母），如 "E = mc2"、"xi + xj"。
+    已是 $...$ 或以 \\ 开头的行不处理。"""
     if not text:
         return text
+    out = []
+    for ln in (text or "").split("\n"):
+        s = ln.strip()
+        if (s and not s.startswith("$") and not s.startswith("\\")
+                and (_GREEK_RE.search(s)
+                     or (_MATH_OPS_RE.search(s) and not _WORD_RE.search(s)))):
+            out.append(f"${s}$")
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
+def sanitize_unicode(text):
+    """编译前清洗进入 LaTeX 的文本：数学符号→LaTeX、引号规范；emoji/私用区/不可打印字符删除或替换并告警。
+    $...$ 数学段内符号转成不带 $ 的 LaTeX 命令（避免嵌套数学模式）。"""
+    if not text:
+        return text
+    # 先暂存 $...$ 数学段，段内符号转成裸 LaTeX 命令
+    math_holders = []
+
+    def _hold(m):
+        seg = m.group(0)[1:-1]
+        seg_out = []
+        for ch in seg:
+            if ch in _MATH_UNI:
+                seg_out.append(_MATH_UNI[ch].strip("$"))
+            else:
+                seg_out.append(ch)
+        math_holders.append("$" + "".join(seg_out) + "$")
+        return f"\x00S{len(math_holders) - 1}\x00"
+
+    t = re.sub(r"\$[^$]*\$", _hold, str(text))
     out, warn = [], 0
-    for ch in text:
+    for ch in t:
+        if ch == "\x00":      # 数学段哨兵，原样保留以便还原
+            out.append(ch)
+            continue
         if ch in _MATH_UNI:
             out.append(_MATH_UNI[ch]); continue
         o = ord(ch)
@@ -371,9 +416,12 @@ def sanitize_unicode(text):
             out.append("{\\bfseries 注意：}")
             continue
         out.append(ch)
+    result = "".join(out)
+    for i, h in enumerate(math_holders):
+        result = result.replace(f"\x00S{i}\x00", h)
     if warn:
         print(f"[sanitize_unicode] 替换/删除 {warn} 个特殊 Unicode 字符", flush=True)
-    return "".join(out)
+    return result
 
 
 class PdfTranslatorEngine:
@@ -1140,6 +1188,9 @@ class PdfTranslatorEngine:
             if on_progress:
                 on_progress(i + 1, total)
             typ, txt = merged[i]
+            # 公式保护：翻译前把明显的公式行用 $...$ 包裹，避免被当正文乱译
+            if typ == "para":
+                txt = protect_math(txt)
             key_id = hashlib.md5(f"{typ}\n{txt}".encode("utf-8")).hexdigest()
             if key_id in prog:
                 ok += 1
@@ -1171,11 +1222,22 @@ class PdfTranslatorEngine:
     # ---- MD → LaTeX → PDF（移植 build_pdf.py） ----
     @staticmethod
     def _esc(t):
-        t = str(t).replace("\\", "\\textbackslash{}")
+        # 先暂存 $...$ 数学段（公式里的 _ ^ \\ 等是 LaTeX 语法，不能被转义），转义后再还原。
+        # 哨兵用 \x00（PDF 提取文本不会含 NUL），避免被 _ \\ 等转义规则误伤。
+        math_holders = []
+
+        def _hold(m):
+            math_holders.append(m.group(0))
+            return f"\x00M{len(math_holders) - 1}\x00"
+
+        t = re.sub(r"\$[^$]*\$", _hold, str(t))
+        t = t.replace("\\", "\\textbackslash{}")
         for a, b in [("&", "\\&"), ("%", "\\%"), ("$", "\\$"), ("#", "\\#"),
                      ("_", "\\_"), ("{", "\\{"), ("}", "\\}"),
                      ("~", "\\textasciitilde{}"), ("^", "\\textasciicircum{}")]:
             t = t.replace(a, b)
+        for i, h in enumerate(math_holders):
+            t = t.replace(f"\x00M{i}\x00", h)
         return t
 
     def _latex_document(self, stem, secs):
