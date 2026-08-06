@@ -1019,7 +1019,7 @@ class ArxivPlugin(BasePlugin):
         chain = getattr(msg, "chain", None) if msg is not None else None
         if chain is not None:
             return any(
-                any(str(getattr(ele, f, "")) == bot_id for f in ("pid", "target", "qq") if hasattr(ele, f))
+                getattr(ele, "pid", None) == bot_id
                 for ele in chain
                 if isinstance(ele, At)
             )
