@@ -566,15 +566,19 @@ class PdfTranslatorEngine:
 
     @staticmethod
     def _inject_preamble(main_tex):
-        """在根 tex 的 \\documentclass 行后注入 ctex，hyperref 选项通过
-        \\PassOptionsToPackage 在 ctex 前传递（ctex 内部加载 hyperref，直接
-        \\usepackage{hyperref} 会导致选项冲突）。重复调用去重。"""
+        """在根 tex 的 \\documentclass 行后注入 ctex 并确保 hyperref 可用：
+        - \\PassOptionsToPackage 传 hyperref 选项（先于任何加载执行）
+        - ctex：ctexart 类内部会加载 hyperref；article 类 + \\usepackage{ctex} 则不会
+        - \\@ifpackageloaded{hyperref} 条件判断：已加载（ctexart 类）则不重复加载避免
+          Option clash；未加载（article 类）则 \\RequirePackage{hyperref} 显式加载，
+          否则原论文中的 \\href 等命令会 Undefined control sequence
+        重复调用去重。"""
         p = str(main_tex)
         text = open(p, encoding="utf-8", errors="ignore").read()
         lines = text.split("\n")
 
-        # 1. 删除原 preamble 中任何显式 \usepackage[...]{hyperref} 行
-        #    （ctex 内部会加载 hyperref，重复加载会导致选项冲突）
+        # 1. 删除原 preamble 中任何显式 \usepackage[...]{hyperref} 行，
+        #    hyperref 统一由下方条件加载（重复加载会导致选项冲突）
         new_lines = []
         for ln in lines:
             s = ln.strip()
@@ -584,11 +588,14 @@ class PdfTranslatorEngine:
             new_lines.append(ln)
         lines = new_lines
 
-        # 2. 在 \documentclass 后注入 PassOptionsToPackage + ctex
+        # 2. 在 \documentclass 后注入 PassOptionsToPackage + ctex + 条件加载 hyperref
         have = set(lines)
         inject = [
             "\\PassOptionsToPackage{unicode=true,pdfencoding=auto,psdextra}{hyperref}",
             "\\usepackage[UTF8,fontset=fandol]{ctex}",
+            "\\makeatletter",
+            "\\@ifpackageloaded{hyperref}{}{\\RequirePackage{hyperref}}",
+            "\\makeatother",
         ]
         add = [x for x in inject if not any(x in h for h in have)]
         if add:
