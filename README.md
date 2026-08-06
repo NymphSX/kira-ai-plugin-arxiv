@@ -1,6 +1,6 @@
 # kira-ai-plugin-arxiv
 
-arXiv 学术助手插件 v2.0.0 —— 由 `kira-ai-plugin-arxiv-search` 与 `pdf_translator`（论文翻译中文 PDF 引擎）二合一合并而来。
+arXiv 学术助手插件 v2.0.1 —— 由 `kira-ai-plugin-arxiv-search` 与 `pdf_translator`（论文翻译中文 PDF 引擎）二合一合并而来。
 
 ## 功能
 
